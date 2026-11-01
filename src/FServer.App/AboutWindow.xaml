@@ -1,0 +1,107 @@
+<Window x:Class="FServer.App.AboutWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="关于 FServer"
+        Width="460"
+        MinHeight="280"
+        MaxHeight="520"
+        SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Background="{DynamicResource BodyBackgroundGradient}"
+        FontFamily="Microsoft YaHei UI, Segoe UI">
+
+    <Border Margin="20"
+            Background="{DynamicResource ControlBackground}"
+            BorderBrush="{DynamicResource ControlBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="10"
+            Padding="24,20,24,18">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- 头部：图标 + 产品名 -->
+            <StackPanel Grid.Row="0" Orientation="Horizontal">
+                <Border Width="48" Height="48"
+                        CornerRadius="10"
+                        Background="{DynamicResource ToggleOnBackground}">
+                    <TextBlock FontFamily="Segoe Fluent Icons, Segoe UI Symbol"
+                               FontSize="28"
+                               Foreground="White"
+                               Text="&#xE83B;"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"/>
+                </Border>
+                <StackPanel Margin="14,0,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="FServer - 轻量级 FTP 服务器"
+                               FontSize="18" FontWeight="Bold"
+                               Foreground="{DynamicResource HeadingForeground}"/>
+                    <TextBlock x:Name="VersionText"
+                               FontSize="12"
+                               Foreground="{DynamicResource TextForeground}"
+                               Margin="0,2,0,0"/>
+                </StackPanel>
+            </StackPanel>
+
+            <!-- 介绍 -->
+            <StackPanel Grid.Row="1" Margin="0,20,0,10">
+                <TextBlock Text="轻量级 FTP 服务器，开箱即用"
+                           FontSize="13" Foreground="{DynamicResource HeadingForeground}"
+                           FontWeight="SemiBold"/>
+                <TextBlock TextWrapping="Wrap"
+                           FontSize="12" Foreground="{DynamicResource TextForeground}"
+                           Margin="0,6,0,0" LineHeight="19">
+                    基于 Rust 的 libunftp 提供协议栈，WPF 可视化管理面板。
+                    默认端口 2121，SQLite 持久化配置与用户，支持断点续传、多用户权限与传输统计。
+                </TextBlock>
+
+                <TextBlock Margin="0,16,0,0"
+                           FontSize="11" Foreground="{DynamicResource TextForeground}">
+                    <Run Text="技术栈：" FontWeight="SemiBold"/>
+                    <Run Text="Rust (libunftp) · .NET 4.8 WPF · SQLite"/>
+                </TextBlock>
+
+                <TextBlock Margin="0,16,0,0"
+                           FontSize="11" Foreground="{DynamicResource TextForeground}">
+                    <Run Text="©2026 Powered by Coldsea Team. Developer by landeyucc"/>
+                </TextBlock>
+
+                <!-- 官网 / GitHub 链接（换行 + 可点击） -->
+                <StackPanel Margin="0,18,0,0">
+                    <TextBlock FontSize="12" Foreground="{DynamicResource TextForeground}" LineHeight="22">
+                        <Run Text="官网："/>
+                        <Hyperlink NavigateUri="https://fserver.coldsea.vip"
+                                   Foreground="{DynamicResource HeadingForeground}"
+                                   FontFamily="Consolas"
+                                   RequestNavigate="Link_RequestNavigate">
+                            https://fserver.coldsea.vip
+                        </Hyperlink>
+                    </TextBlock>
+                    <TextBlock FontSize="12" Foreground="{DynamicResource TextForeground}" LineHeight="22">
+                        <Run Text="Github："/>
+                        <Hyperlink NavigateUri="https://github.com/landeyucc/fserver"
+                                   Foreground="{DynamicResource HeadingForeground}"
+                                   FontFamily="Consolas"
+                                   RequestNavigate="Link_RequestNavigate">
+                            https://github.com/landeyucc/fserver
+                        </Hyperlink>
+                    </TextBlock>
+                </StackPanel>
+            </StackPanel>
+
+            <!-- 底部按钮 -->
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Click="CloseBtn_Click"
+                        Width="100" Height="32"
+                        Style="{StaticResource PrimaryButton}">
+                    关闭
+                </Button>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

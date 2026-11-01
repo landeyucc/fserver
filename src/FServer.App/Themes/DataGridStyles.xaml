@@ -167,4 +167,67 @@
         </Setter>
     </Style>
 
+    <!-- ====== ModernCheckBoxWithLabel：勾选框在前（左），文字在后（右）。供带说明文字的场景 ====== -->
+    <Style x:Key="ModernCheckBoxWithLabel" TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Padding" Value="0,0,0,2"/>
+        <Setter Property="Foreground" Value="{DynamicResource ControlForeground}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="CheckBox">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <!-- 勾框（前置） -->
+                        <Border x:Name="CheckBorder"
+                                Grid.Column="0"
+                                Width="16" Height="16"
+                                Margin="0,0,8,0"
+                                Background="{DynamicResource ControlBackground}"
+                                BorderBrush="{DynamicResource ToggleOffBackground}"
+                                BorderThickness="1"
+                                CornerRadius="3"
+                                SnapsToDevicePixels="True"
+                                VerticalAlignment="Center">
+                            <Path x:Name="CheckMark"
+                                  Width="8" Height="8"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Data="M 1 4 L 3 6 L 7 2"
+                                  Stroke="{DynamicResource ToggleThumbBackground}"
+                                  StrokeThickness="1.8"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  Stretch="Fill"
+                                  Visibility="Collapsed"/>
+                        </Border>
+                        <!-- 标签文字（后置） -->
+                        <ContentPresenter Grid.Column="1"
+                                          VerticalAlignment="Center"
+                                          RecognizesAccessKey="True"/>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="CheckBorder" Property="Background"
+                                    Value="{DynamicResource ToggleOnBackground}"/>
+                            <Setter TargetName="CheckBorder" Property="BorderBrush"
+                                    Value="{DynamicResource ToggleOnBackground}"/>
+                            <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="CheckBorder" Property="BorderBrush"
+                                    Value="{DynamicResource ToggleOnBackground}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="CheckBorder" Property="Opacity" Value="0.4"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
 </ResourceDictionary>

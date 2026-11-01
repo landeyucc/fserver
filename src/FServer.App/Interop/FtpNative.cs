@@ -10,7 +10,7 @@ namespace FServer.App.Interop
         Info    = 1,
         Warn    = 2,
         Error   = 3,
-        Session = 4,  // Rust 侧推的会话事件（ONLINE/OFFLINE）
+        Session = 4,
     }
 
     /// <summary>
@@ -106,12 +106,34 @@ namespace FServer.App.Interop
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool ftp_server_is_running(IntPtr handle);
+
+        /// <summary>
+        /// 强制踢掉一个在线会话。返回 0=成功、-1=handle 空、-2=用户不存在。
+        /// </summary>
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern int ftp_server_kick_session(IntPtr handle,
+            [MarshalAs(UnmanagedType.LPStr)] string user);
+
+        /// <summary>
+        /// 设置登录横幅 / MOTD。空串或 null 表示使用 libunftp 默认 "220 Ready"。
+        /// </summary>
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern int ftp_server_set_greeting(IntPtr handle,
+            [MarshalAs(UnmanagedType.LPStr)] string banner);
+
+        /// <summary>
+        /// 设置被动模式端口范围。min=max=0 表示不限制让 OS 分配；
+        /// 其他值要求 min in [1024..65535]、max in [1024..65535]、min <= max。
+        /// Start 之前调用生效。
+        /// </summary>
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int ftp_server_set_passive_port_range(IntPtr handle, int min, int max);
     }
 
     public sealed class FtpServer : IDisposable
     {
         private FtpServerHandle _handle;
-        private LogCallback _callback;       // 强引用，保活 delegate（让函数指针不悬空）
+        private LogCallback _callback;       // 强引用保活 delegate，防止函数指针悬空
         private IntPtr _callbackPtr;         // Marshal.GetFunctionPointerForDelegate 固定后的函数指针
         private IntPtr _userDataPtr;         // ctx = GCHandle.Alloc(this, Normal).ToIntPtr
 
@@ -128,12 +150,10 @@ namespace FServer.App.Interop
 
         private void InstallCallback()
         {
-            // 1) 创建 delegate，_callback 字段持有强引用 —— GC 不会回收
             _callback = new LogCallback(OnNativeLog);
-            // 2) 取出函数指针（Marshal.GetFunctionPointerForDelegate 内部会把 delegate 标记 pinned，
-            //    直到 delegate 被 GC 回收；因此只要 _callback 还有根，指针就一直有效）
+            // Marshal.GetFunctionPointerForDelegate 内部会把 delegate 标记 pinned，
+            // 只要 _callback 还有根，函数指针就一直有效
             _callbackPtr = Marshal.GetFunctionPointerForDelegate(_callback);
-            // 3) ctx 指向 this（Normal GCHandle，引用类型也 OK）
             _userDataPtr = GCHandle.ToIntPtr(GCHandle.Alloc(this, GCHandleType.Normal));
             Native.ftp_server_set_log_cb(_handle.DangerousGetHandle(), _callbackPtr, _userDataPtr);
             Console.WriteLine($"[Interop] InstallCallback cb_ptr=0x{_callbackPtr.ToInt64():X} ctx=0x{_userDataPtr.ToInt64():X}");
@@ -191,6 +211,20 @@ namespace FServer.App.Interop
 
         public bool IsRunning => Native.ftp_server_is_running(_handle.DangerousGetHandle());
 
+        /// <summary>设置登录横幅 / MOTD（空串=用 libunftp 默认 220 Ready）。Start 之前调用生效。</summary>
+        public void SetGreeting(string banner)
+            => ThrowOn(Native.ftp_server_set_greeting(_handle.DangerousGetHandle(),
+                string.IsNullOrEmpty(banner) ? null : banner));
+
+        /// <summary>设置被动模式端口范围（Start 之前调用生效）。min=max=0 表示不限制让 OS 分配。</summary>
+        public void SetPassivePortRange(ushort min, ushort max)
+            => ThrowOn(Native.ftp_server_set_passive_port_range(
+                _handle.DangerousGetHandle(), (int)min, (int)max));
+
+        /// <summary>强制踢掉指定用户的在线会话。返回 true=成功。</summary>
+        public bool KickSession(string username)
+            => Native.ftp_server_kick_session(_handle.DangerousGetHandle(), username) == 0;
+
         private static void ThrowOn(int rc)
         {
             if (rc != 0) throw new InvalidOperationException($"Rust ftp_core 返回 {rc}");
@@ -206,7 +240,7 @@ namespace FServer.App.Interop
         {
             if (_handle != null && !_handle.IsInvalid)
             {
-                // 先把 Rust 侧回调清掉，防止 C# 对象被 GC 后还被回调
+                // 先清 Rust 侧回调，防止 C# 对象被 GC 后还被回调
                 if (_callbackPtr != IntPtr.Zero)
                 {
                     Native.ftp_server_set_log_cb(_handle.DangerousGetHandle(), IntPtr.Zero, IntPtr.Zero);
@@ -216,7 +250,7 @@ namespace FServer.App.Interop
                     GCHandle.FromIntPtr(_userDataPtr).Free();
                     _userDataPtr = IntPtr.Zero;
                 }
-                // 清 _callback 根引用，让 Marshal 把它 unpinned
+                // 清 _callback 根引用 → Marshal 会把它 unpinned
                 _callback = null;
                 _callbackPtr = IntPtr.Zero;
 

@@ -78,8 +78,8 @@ namespace FServer.App
         {
             var p = (parameter as string)?.Split('|');
             if (p == null || p.Length != 2) return Binding.DoNothing;
-            var trueKey = p[0];  // IsRunning=true 时用哪个 Style
-            var falseKey = p[1]; // IsRunning=false 时用哪个 Style
+            var trueKey = p[0];
+            var falseKey = p[1];
             var key = (value is bool b && b) ? trueKey : falseKey;
             return Application.Current.TryFindResource(key) as Style ?? Binding.DoNothing;
         }
@@ -128,5 +128,72 @@ namespace FServer.App
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
             => Binding.DoNothing;
+    }
+
+    /// <summary>
+    /// double ratio × parameter (double maxWidth) → pixels。用于自绘柱状图。
+    /// 例：Value=0.3, Parameter=300 → 返回 90。
+    /// </summary>
+    public class RatioToWidthConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is double r && parameter is string s && double.TryParse(s, out var max) && max > 0)
+            {
+                return Math.Max(0, r * max);
+            }
+            return 0.0;
+        }
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+            => Binding.DoNothing;
+    }
+
+    /// <summary>
+    /// 传输活动 Op（DOWNLOAD/UPLOAD/...）→ Brush。下载蓝、上传绿、删除红、其余灰。
+    /// </summary>
+    public class TransferOpToBrushConverter : IValueConverter
+    {
+        private static readonly Brush Blue   = new SolidColorBrush(Color.FromRgb(0x3B, 0x82, 0xF6));
+        private static readonly Brush Green  = new SolidColorBrush(Color.FromRgb(0x22, 0xC5, 0x5E));
+        private static readonly Brush Red    = new SolidColorBrush(Color.FromRgb(0xE5, 0x3E, 0x3E));
+        private static readonly Brush Muted  = new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8));
+
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            var op = value as string ?? "";
+            return op switch
+            {
+                "DOWNLOAD"   => Blue,
+                "UPLOAD"     => Green,
+                "DELETE"     => Red,
+                _            => Muted,
+            };
+        }
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+            => Binding.DoNothing;
+    }
+
+    /// <summary>
+    /// ulong bytes → 人类可读字符串（B/KB/MB/GB）。
+    /// 例：12345 → "12.0 KB"。
+    /// </summary>
+    public class BytesDisplayConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is ulong b) return FormatBytes(b);
+            if (value is long l) return FormatBytes((ulong)Math.Max(0, l));
+            return "0 B";
+        }
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+            => Binding.DoNothing;
+
+        private static string FormatBytes(ulong b)
+        {
+            if (b >= 1_073_741_824) return $"{b / 1_073_741_824.0:F2} GB";
+            if (b >= 1_048_576)     return $"{b / 1_048_576.0:F2} MB";
+            if (b >= 1024)          return $"{b / 1024.0:F1} KB";
+            return $"{b} B";
+        }
     }
 }

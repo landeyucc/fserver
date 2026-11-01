@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>FServer.Icons</AssemblyName>
+    <RootNamespace>FServer.Icons</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+  </PropertyGroup>
+
+  <!--
+    双通路嵌入：
+     - Resource（WPF ResourcePart）→ pack://application:,,,/FServer.Icons;component/ftp.ico  (WPF Window.Icon)
+    - EmbeddedResource → Assembly.GetManifestResourceStream  (WinForms NotifyIcon 从 DLL 流加载)
+  -->
+  <ItemGroup>
+    <Resource Include="ftp.ico" />
+    <Resource Include="ftp2.ico" />
+    <EmbeddedResource Include="ftp.ico" LogicalName="FServer.Icons.ftp.ico" />
+    <EmbeddedResource Include="ftp2.ico" LogicalName="FServer.Icons.ftp2.ico" />
+  </ItemGroup>
+
+</Project>

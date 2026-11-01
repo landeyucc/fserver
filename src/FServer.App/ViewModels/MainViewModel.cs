@@ -109,6 +109,31 @@ namespace FServer.App.ViewModels
     }
 
     /// <summary>
+    /// 最近一次下载/上传/删除/重命名等传输活动条目。
+    /// 由 Rust 侧 libunftp DataListener 推 SESSION:DATA:* 事件，ParseSessionEvent 追加进来。
+    /// </summary>
+    public class TransferEntryVm
+    {
+        public DateTime Time { get; set; } = DateTime.Now;
+        public string Username { get; set; }
+        /// <summary>操作类型：DOWNLOAD / UPLOAD / DELETE / RENAME / MAKEDIR / REMOVEDIR</summary>
+        public string Op { get; set; }
+        public string Path { get; set; }
+        public string Extra { get; set; }
+        public ulong Bytes { get; set; }
+        public string BytesDisplay => FormatBytes(Bytes);
+
+        /// <summary>统一 bytes→人类可读字符串（供 UI 绑定）。</summary>
+        public static string FormatBytes(ulong b)
+        {
+            if (b >= 1_073_741_824) return $"{b / 1_073_741_824.0:F2} GB";
+            if (b >= 1_048_576) return $"{b / 1_048_576.0:F2} MB";
+            if (b >= 1024) return $"{b / 1024.0:F1} KB";
+            return $"{b} B";
+        }
+    }
+
+    /// <summary>
     /// 单条日志。比纯 string 多了 Time + Level，UI 可按级别着色、按时间排序。
     /// </summary>
     public class LogEntryVm
@@ -128,18 +153,15 @@ namespace FServer.App.ViewModels
         /// <summary>启动从 DB 加载期间临时置 true，阻止自动 flush 出现中间态写入。</summary>
         private bool _loadingFromDb;
 
-        // ---- 在线会话时长定时器（智能启停：有会话才跑） ----
         private readonly DispatcherTimer _sessionTick = new DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(1),
             IsEnabled = false,
         };
 
-        // ---- 历史日志文件（每次 Start→Stop 算一次会话，写到 [exe]\log\YYYY-MM-DD_HH-mm-ss.log） ----
         private StreamWriter _logWriter;
         private DateTime _sessionStart;
 
-        // ---- 基础配置 ----
         private ushort _port = 2121;
         public ushort Port
         {
@@ -161,6 +183,59 @@ namespace FServer.App.ViewModels
             set { _maxConn = value; OnPropertyChanged(); SaveConfig(); }
         }
 
+        private string _bannerText = "";
+        /// <summary>登录横幅 / MOTD，空串使用 libunftp 默认 220 Ready。改完自动持久化到 SQLite。</summary>
+        public string BannerText
+        {
+            get => _bannerText;
+            set { _bannerText = value ?? ""; OnPropertyChanged(); SaveConfig(); }
+        }
+
+        private ushort _passiveMinPort = 0;
+        /// <summary>被动模式端口最小值。0 表示不限制，由 OS 自动分配。Start 前生效。</summary>
+        public ushort PassiveMinPort
+        {
+            get => _passiveMinPort;
+            set { _passiveMinPort = value; OnPropertyChanged(); SaveConfig(); }
+        }
+
+        private ushort _passiveMaxPort = 0;
+        /// <summary>被动模式端口最大值。0 表示不限制，由 OS 自动分配。Start 前生效。</summary>
+        public ushort PassiveMaxPort
+        {
+            get => _passiveMaxPort;
+            set { _passiveMaxPort = value; OnPropertyChanged(); SaveConfig(); }
+        }
+
+        private bool _silentStartup;
+        /// <summary>静默启动：启动时主窗自动隐藏，仅托盘运行。可与 AutoStartServer 独立或组合。</summary>
+        public bool SilentStartup
+        {
+            get => _silentStartup;
+            set { _silentStartup = value; OnPropertyChanged(); SaveConfig(); }
+        }
+
+        private bool _autoStartServer;
+        /// <summary>开机自启：写入 HKCU\...\Run 注册表项。独立开关，不依赖 SilentStartup。</summary>
+        public bool AutoStartServer
+        {
+            get => _autoStartServer;
+            set { _autoStartServer = value; OnPropertyChanged(); SaveConfig(); }
+        }
+
+        /// <summary>编译期常量：Debug=true / Release=false，控制是否显示高级（被动端口、MOTD）UI。</summary>
+        public bool IsDebugBuild
+        {
+            get
+            {
+#if DEBUG
+                return true;
+#else
+                return false;
+#endif
+            }
+        }
+
         private bool _isRunning;
         public bool IsRunning
         {
@@ -175,17 +250,78 @@ namespace FServer.App.ViewModels
             ? (IsRunning ? "停止中..." : "启动中...")
             : (IsRunning ? "停止服务器" : "启动服务器");
 
-        // ---- 用户 ----
         public ObservableCollection<UserEntryVm> Users { get; } = new ObservableCollection<UserEntryVm>();
         public UserEntryVm NewUser { get; } = new UserEntryVm { Name = "test", Password = "test", ReadOnly = false };
 
-        // ---- 在线会话 ----
         public ObservableCollection<SessionEntryVm> Sessions { get; } = new ObservableCollection<SessionEntryVm>();
 
-        // ---- 日志 ----
+        public ObservableCollection<TransferEntryVm> Transfers { get; } = new ObservableCollection<TransferEntryVm>();
+
+        private List<DailyStatRow> _recentDays = new();
+        public List<DailyStatRow> RecentDays
+        {
+            get => _recentDays;
+            private set { _recentDays = value; OnPropertyChanged(); }
+        }
+        public ulong TodayBytesDown => RecentDays.Count > 0 ? RecentDays[RecentDays.Count - 1].BytesDown : 0;
+        public ulong TodayBytesUp => RecentDays.Count > 0 ? RecentDays[RecentDays.Count - 1].BytesUp : 0;
+        public ulong TodayTotalOps => RecentDays.Count > 0 ? RecentDays[RecentDays.Count - 1].TotalOps : 0;
+        public ulong TotalBytesDown7d => RecentDays.Aggregate(0ul, (a, b) => a + b.BytesDown);
+        public ulong TotalBytesUp7d => RecentDays.Aggregate(0ul, (a, b) => a + b.BytesUp);
+        public ulong TotalOps7d => RecentDays.Aggregate(0ul, (a, b) => a + b.TotalOps);
+        public ulong PeakBytesDay7d => RecentDays.Aggregate(0ul, (a, b) => Math.Max(a, b.BytesDown + b.BytesUp));
+        /// <summary>柱状图一行的数据。</summary>
+        public class BarRowVm
+        {
+            public DateTime Date { get; set; }
+            public string Label => Date.ToString("MM-dd");
+            public ulong BytesDown { get; set; }
+            public ulong BytesUp { get; set; }
+            public ulong Total => BytesDown + BytesUp;
+            public string TotalDisplay => TransferEntryVm.FormatBytes(Total);
+            /// <summary>当天总量相对于 7 天峰值的比例 0~1。XAML 里用 * 固定宽算出像素宽。</summary>
+            public double Ratio { get; set; }
+        }
+        private List<BarRowVm> _dashboardBars = new();
+        public List<BarRowVm> DashboardBars
+        {
+            get => _dashboardBars;
+            private set { _dashboardBars = value; OnPropertyChanged(); }
+        }
+
+        public void RefreshDashboard()
+        {
+            try
+            {
+                RecentDays = _repo.LoadRecentDays(7);
+                OnPropertyChanged(nameof(TodayBytesDown));
+                OnPropertyChanged(nameof(TodayBytesUp));
+                OnPropertyChanged(nameof(TodayTotalOps));
+                OnPropertyChanged(nameof(TotalBytesDown7d));
+                OnPropertyChanged(nameof(TotalBytesUp7d));
+                OnPropertyChanged(nameof(TotalOps7d));
+                OnPropertyChanged(nameof(PeakBytesDay7d));
+
+                var peak = PeakBytesDay7d == 0 ? 1 : PeakBytesDay7d;
+                DashboardBars = RecentDays.Select(r => new BarRowVm
+                {
+                    Date = r.Date,
+                    BytesDown = r.BytesDown,
+                    BytesUp = r.BytesUp,
+                    Ratio = (double)(r.BytesDown + r.BytesUp) / peak,
+                }).ToList();
+                OnPropertyChanged(nameof(DashboardBars));
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[VM.RefreshDashboard] {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+
         public ObservableCollection<LogEntryVm> LogLines { get; } = new ObservableCollection<LogEntryVm>();
 
-        // ---- 本机 IP（状态栏显示，可手动刷新） ----
         private string _localIpList = "";
         public string LocalIpList
         {
@@ -212,7 +348,6 @@ namespace FServer.App.ViewModels
             {
                 foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
-                    // 只看在线 + 非 Loopback + 非 Tunnel
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
                     if (ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
@@ -221,7 +356,6 @@ namespace FServer.App.ViewModels
                     {
                         if (ip.Address.AddressFamily != AddressFamily.InterNetwork) continue;
                         var s = ip.Address.ToString();
-                        // 跳过 169.254 自分配（没连上 DHCP 的网卡）
                         if (s.StartsWith("169.254.")) continue;
                         if (!ips.Contains(s)) ips.Add(s);
                     }
@@ -232,7 +366,6 @@ namespace FServer.App.ViewModels
                 Console.WriteLine($"[VM.RefreshLocalIps] 枚举网卡失败: {ex.Message}");
             }
 
-            // 排序：先内网段（192.168.x / 10.x / 172.16-31.x），其他往后
             ips = ips.OrderBy(ip => ip.StartsWith("192.168.") ? 0
                                   : ip.StartsWith("10.") ? 1
                                   : ip.StartsWith("172.16.") || ip.StartsWith("172.17.") || ip.StartsWith("172.18.")
@@ -245,35 +378,35 @@ namespace FServer.App.ViewModels
 
         public MainViewModel()
         {
-            // 1. 先绑事件（后面 LoadFromDb 会触发 CollectionChanged，但 _loadingFromDb 会挡掉 flush）
+            // LoadFromDb 期间 CollectionChanged 会被 _loadingFromDb 挡掉 flush
             Users.CollectionChanged += (s, e) => { if (!_loadingFromDb) SaveUsers(); };
 
-            // 2. Sessions 变化 → 智能启停定时器（无会话时不白跑 CPU）
             Sessions.CollectionChanged += (s, e) => UpdateSessionTickState();
 
-            // 3. 定时器每秒批量刷新所有在线会话的 OnlineFor
             _sessionTick.Tick += (s, e) =>
             {
                 foreach (var sess in Sessions)
                     sess.TickOnlineFor();
             };
 
-            // 2. 从 SQLite 加载（期间 _loadingFromDb=true，任何自动 flush 都会被 skip）
             bool dbHadData = false;
             _loadingFromDb = true;
             try
             {
-                // 应用设置
                 var s = _repo.LoadSettings();
                 if (s != null)
                 {
                     Port = (ushort)s.Port;
                     RootDir = s.RootDir ?? RootDir;
                     MaxConnections = (uint)s.MaxConnections;
+                    BannerText = s.BannerText ?? "";
+                    PassiveMinPort = (ushort)(s.PassivePortMin < 0 ? 0 : s.PassivePortMin > 65535 ? 65535 : s.PassivePortMin);
+                    PassiveMaxPort = (ushort)(s.PassivePortMax < 0 ? 0 : s.PassivePortMax > 65535 ? 65535 : s.PassivePortMax);
+                    SilentStartup = s.SilentStartup;
+                    AutoStartServer = s.AutoStartServer;
                     dbHadData = true;
-                    Console.WriteLine($"[VM.ctor] loaded settings: port={Port} root={RootDir} maxConn={MaxConnections}");
+                    Console.WriteLine($"[VM.ctor] loaded settings: port={Port} root={RootDir} maxConn={MaxConnections} banner={(string.IsNullOrEmpty(BannerText) ? "(默认)" : "已配置")} passive=[{PassiveMinPort},{PassiveMaxPort}] silent={SilentStartup} autoStart={AutoStartServer}");
                 }
-                // 用户
                 var rows = _repo.LoadUsers();
                 if (rows.Count > 0)
                 {
@@ -301,14 +434,14 @@ namespace FServer.App.ViewModels
                 Console.ResetColor();
             }
 
-            // 3. DB 空 → seed 默认 admin/guest（只在首次启动时写 DB）
+            // DB 空 → seed 默认 admin/guest（只在首次启动时写 DB）
             if (!dbHadData)
             {
                 var admin = new UserEntryVm { Name = "admin", Password = "admin123", ReadOnly = false, RootPath = "", Enabled = true };
                 var guest = new UserEntryVm { Name = "guest", Password = "guestuser", ReadOnly = true, RootPath = "", Enabled = true };
                 admin.PropertyChanged += OnUserPropertyChanged;
                 guest.PropertyChanged += OnUserPropertyChanged;
-                Users.Add(admin);   // CollectionChanged 被 _loadingFromDb 挡掉，手动 save
+                Users.Add(admin);
                 Users.Add(guest);
                 _loadingFromDb = false;
                 SaveConfig();
@@ -318,21 +451,18 @@ namespace FServer.App.ViewModels
             else
             {
                 _loadingFromDb = false;
-                // 已有数据，把 PropertyChanged 绑定补给已加载的用户
                 foreach (var u in Users)
-                    u.PropertyChanged -= OnUserPropertyChanged; // 防重复
+                    u.PropertyChanged -= OnUserPropertyChanged;
                 foreach (var u in Users)
                     u.PropertyChanged += OnUserPropertyChanged;
             }
 
-            // 4. 启动时枚举一次本机 IP（状态栏显示用）
             RefreshLocalIps();
+            RefreshDashboard();
 
-            // 5. 进程退出兜底——防止崩溃/强制关闭时 .log 还没 flush 就丢了
+            // 进程退出兜底——防止崩溃/强制关闭时 .log 还没 flush 就丢了
             AppDomain.CurrentDomain.ProcessExit += (s, e) => CloseSessionLog("进程退出");
         }
-
-        // ─────────────────── 历史日志文件写入 ───────────────────
 
         /// <summary>
         /// 打开本次会话的历史日志文件。每次 Start FTP 时调一次。
@@ -345,7 +475,7 @@ namespace FServer.App.ViewModels
             try
             {
                 var dir = Path.Combine(AppContext.BaseDirectory, "log");
-                Directory.CreateDirectory(dir);  // 幂等，已存在则跳过
+                Directory.CreateDirectory(dir);
 
                 _sessionStart = DateTime.Now;
                 var fileName = _sessionStart.ToString("yyyy-MM-dd_HH-mm-ss") + ".log";
@@ -354,7 +484,7 @@ namespace FServer.App.ViewModels
                 var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.Read);
                 _logWriter = new StreamWriter(fs, new UTF8Encoding(false), 4096)
                 {
-                    AutoFlush = true  // 每条写完立刻 flush，崩溃最多丢一条
+                    AutoFlush = true
                 };
 
                 _logWriter.WriteLine("==============================================");
@@ -413,7 +543,6 @@ namespace FServer.App.ViewModels
             }
         }
 
-        // 用户任意属性（Name/Password/ReadOnly/RootPath）编辑 → 自动 flush
         private void OnUserPropertyChanged(object sender, PropertyChangedEventArgs e)
         {
             SaveUsers();
@@ -428,7 +557,13 @@ namespace FServer.App.ViewModels
                     Port = Port,
                     RootDir = RootDir,
                     MaxConnections = (int)MaxConnections,
+                    BannerText = BannerText,
+                    PassivePortMin = PassiveMinPort,
+                    PassivePortMax = PassiveMaxPort,
+                    SilentStartup = SilentStartup,
+                    AutoStartServer = AutoStartServer,
                 });
+                Services.RegistryHelper.SetAutoStart(AutoStartServer);
             }
             catch (Exception ex)
             {
@@ -460,23 +595,17 @@ namespace FServer.App.ViewModels
             }
         }
 
-        // ──────────────────────────────────────────────
-        // 命令
-        // ──────────────────────────────────────────────
-
         public void Start()
         {
             if (_isTransitioning || IsRunning) return;
             _isTransitioning = true; OnPropertyChanged(nameof(ToggleButtonEnabled)); OnPropertyChanged(nameof(StartStopLabel));
             try
             {
-                // 启动前强制 flush 一次（保险：防止 UI 刚编辑完还没触发 PropertyChanged）
                 SaveConfig();
                 SaveUsers();
 
                 Console.WriteLine($"[VM.Start] port={Port} root={RootDir} maxConn={MaxConnections} users={Users.Count}");
 
-                // 开本次会话的历史日志文件
                 OpenSessionLog();
 
                 if (_server == null)
@@ -489,14 +618,27 @@ namespace FServer.App.ViewModels
                 _server.SetPort(Port);
                 _server.SetRoot(RootDir);
                 _server.SetMaxConnections(MaxConnections);
+                _server.SetGreeting(BannerText);
+
+                if (PassiveMinPort == 0 && PassiveMaxPort == 0)
+                {
+                    _server.SetPassivePortRange(0, 0);
+                }
+                else
+                {
+                    if (PassiveMinPort < 1024 || PassiveMaxPort > 65535 || PassiveMinPort > PassiveMaxPort)
+                    {
+                        throw new InvalidOperationException($"被动端口范围无效：{PassiveMinPort}-{PassiveMaxPort}（需在 1024-65535 且 min<=max）");
+                    }
+                    _server.SetPassivePortRange(PassiveMinPort, PassiveMaxPort);
+                }
 
                 _server.ClearUsers();
                 int enabledCount = 0, disabledCount = 0;
                 foreach (var u in Users)
                 {
-                    // 无论 Enabled 与否都注册到 Rust（disabled 用户在 Rust 里 enabled=0，
-                    // 由 Authenticator 统一拒绝登录，530 Login incorrect——比 C# 层跳过更安全：
-                    // 即使 Rust 里后续改了逻辑，disabled 身份也能被识别）
+                    // 无论 Enabled 与否都注册到 Rust：disabled 用户在 Rust 侧 enabled=0，
+                    // 由 Authenticator 统一拒绝登录，比 C# 层跳过更安全——Rust 侧逻辑不会漏判
                     _server.AddUser(u.Name, u.Password, u.ReadOnly,
                         string.IsNullOrWhiteSpace(u.RootPath) ? null : u.RootPath,
                         u.Enabled);
@@ -523,7 +665,6 @@ namespace FServer.App.ViewModels
             {
                 _isTransitioning = false; OnPropertyChanged(nameof(ToggleButtonEnabled)); OnPropertyChanged(nameof(StartStopLabel));
 
-                // 如果 Start 抛异常 → 关掉这次开的日志（原因：启动失败）
                 if (!IsRunning) CloseSessionLog("启动失败");
             }
         }
@@ -550,7 +691,6 @@ namespace FServer.App.ViewModels
             {
                 _isTransitioning = false; OnPropertyChanged(nameof(ToggleButtonEnabled)); OnPropertyChanged(nameof(StartStopLabel));
 
-                // 关本次会话的历史日志文件
                 CloseSessionLog("手动停止");
             }
         }
@@ -558,6 +698,176 @@ namespace FServer.App.ViewModels
         public void Toggle()
         {
             if (IsRunning) Stop(); else Start();
+        }
+
+        /// <summary>强制踢掉一个在线会话。软踢：从注册表移除，客户端下一条命令被 server 拒绝。</summary>
+        public bool KickSession(string username)
+        {
+            if (_server == null || !IsRunning) return false;
+            try
+            {
+                return _server.KickSession(username);
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR", $"踢会话失败：{ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>历史日志目录（<exe>\log）。</summary>
+        public string LogDir => System.IO.Path.Combine(AppContext.BaseDirectory, "log");
+
+        /// <summary>打开历史日志目录（Explorer）。</summary>
+        public void OpenLogFolder()
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(LogDir);
+                System.Diagnostics.Process.Start("explorer.exe", LogDir);
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR", $"打开历史日志目录失败：{ex.Message}");
+            }
+        }
+
+        /// <summary>历史日志文件列表（按时间倒序）。</summary>
+        public class HistoryLogFileVm
+        {
+            public string Name { get; set; }
+            public string FullPath { get; set; }
+            public DateTime StartTime { get; set; }
+            public DateTime EndTime { get; set; }
+            public string Duration { get; set; }
+            public long SizeBytes { get; set; }
+            public string SizeDisplay => SizeBytes >= 1024
+                ? $"{SizeBytes / 1024.0:F1} KB"
+                : $"{SizeBytes} B";
+        }
+
+        private ObservableCollection<HistoryLogFileVm> _historyLogs = new();
+        public ObservableCollection<HistoryLogFileVm> HistoryLogs
+        {
+            get => _historyLogs;
+            private set { _historyLogs = value; OnPropertyChanged(); }
+        }
+
+        public void RefreshHistoryLogs()
+        {
+            HistoryLogs.Clear();
+            try
+            {
+                if (!System.IO.Directory.Exists(LogDir)) return;
+                foreach (var f in System.IO.Directory.GetFiles(LogDir, "*.log"))
+                {
+                    var fi = new System.IO.FileInfo(f);
+                    var start = ParseStartTimeFromName(fi.Name);
+                    var end = fi.LastWriteTime;
+                    HistoryLogs.Add(new HistoryLogFileVm
+                    {
+                        Name = fi.Name,
+                        FullPath = fi.FullName,
+                        StartTime = start,
+                        EndTime = end,
+                        Duration = (end - start).TotalSeconds > 0
+                            ? FormatDuration(end - start)
+                            : "-",
+                        SizeBytes = fi.Length,
+                    });
+                }
+                var sorted = HistoryLogs.OrderByDescending(l => l.Name).ToList();
+                HistoryLogs = new ObservableCollection<HistoryLogFileVm>(sorted);
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR", $"读取历史日志目录失败：{ex.Message}");
+            }
+        }
+
+        private static DateTime ParseStartTimeFromName(string filename)
+        {
+            var name = System.IO.Path.GetFileNameWithoutExtension(filename);
+            if (name.Length < 19) return DateTime.MinValue;
+            try
+            {
+                return DateTime.ParseExact(
+                    $"{name.Substring(0, 4)}-{name.Substring(5, 2)}-{name.Substring(8, 2)} {name.Substring(11, 2)}:{name.Substring(14, 2)}:{name.Substring(17, 2)}",
+                    "yyyy-MM-dd HH:mm:ss", null);
+            }
+            catch { return DateTime.MinValue; }
+        }
+
+        private static string FormatDuration(TimeSpan ts)
+        {
+            if (ts.TotalDays >= 1) return $"{(int)ts.TotalDays}天 {ts.Hours}小时";
+            if (ts.TotalHours >= 1) return $"{ts.Hours}小时 {ts.Minutes}分";
+            if (ts.TotalMinutes >= 1) return $"{ts.Minutes}分 {ts.Seconds}秒";
+            return $"{ts.Seconds}秒";
+        }
+
+        private DispatcherTimer _logCleanupTimer;
+
+        /// <summary>
+        /// 启动日志自动清理：默认每天凌晨 3:00 扫一遍，删除超过 30 天的 .log 文件。
+        /// 应用启动后立即执行一次（避免部署时积压旧文件）。
+        /// </summary>
+        public void StartLogAutoCleanup()
+        {
+            TryCleanupOldLogs();
+
+            _logCleanupTimer = new DispatcherTimer
+            {
+                Interval = NextCleanupInterval(),
+            };
+            _logCleanupTimer.Tick += (s, e) =>
+            {
+                TryCleanupOldLogs();
+                _logCleanupTimer.Interval = NextCleanupInterval();
+            };
+            _logCleanupTimer.Start();
+        }
+
+        /// <summary>
+        /// 日志保留天数（默认 30 天）。0 或负数 = 永不清理。
+        /// 未来可以挪到 Settings。目前硬编码常量。
+        /// </summary>
+        public int LogDaysToKeep { get; set; } = 30;
+
+        private TimeSpan NextCleanupInterval()
+        {
+            var now = DateTime.Now;
+            var next = now.Date.AddDays(1).AddHours(3);
+            var diff = next - now;
+            return diff.TotalMinutes < 1 ? TimeSpan.FromDays(1) : diff;
+        }
+
+        private void TryCleanupOldLogs()
+        {
+            try
+            {
+                if (LogDaysToKeep <= 0 || !System.IO.Directory.Exists(LogDir)) return;
+
+                var cutoff = DateTime.Now.AddDays(-LogDaysToKeep);
+                int removed = 0;
+                foreach (var f in System.IO.Directory.GetFiles(LogDir, "*.log"))
+                {
+                    var fi = new System.IO.FileInfo(f);
+                    if (fi.LastWriteTime < cutoff)
+                    {
+                        fi.Delete();
+                        removed++;
+                    }
+                }
+                if (removed > 0)
+                {
+                    Log("INFO", $"日志自动清理：删除 {removed} 个超过 {LogDaysToKeep} 天的历史日志");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR", $"日志自动清理失败：{ex.Message}");
+            }
         }
 
         public void AddNewUser()
@@ -572,7 +882,7 @@ namespace FServer.App.ViewModels
                 Enabled = true,
             };
             u.PropertyChanged += OnUserPropertyChanged;
-            Users.Add(u); // → CollectionChanged → SaveUsers()
+            Users.Add(u);
             NewUser.Password = "";
         }
 
@@ -585,17 +895,15 @@ namespace FServer.App.ViewModels
                 return;
             }
             u.PropertyChanged -= OnUserPropertyChanged;
-            Users.Remove(u); // → CollectionChanged → SaveUsers()
+            Users.Remove(u);
         }
 
         private void OnServerLog(FtpLogLevel level, string msg)
         {
             Console.WriteLine($"[VM][{level}] {msg}");
-            // 写入本次会话的历史日志文件
             LogToFile(level, msg);
             Application.Current.Dispatcher.BeginInvoke(() =>
             {
-                // Session 事件单独处理（level=4），不进日志 Tab
                 if (level == FtpLogLevel.Session)
                 {
                     ParseSessionEvent(msg);
@@ -626,36 +934,139 @@ namespace FServer.App.ViewModels
         /// 解析 Rust 侧推的会话事件。格式：
         ///   SESSION:ONLINE user=xxx
         ///   SESSION:OFFLINE user=xxx (idle)
+        ///   SESSION:KICK user=xxx (admin)
+        ///   SESSION:DATA:DOWNLOAD user=xxx path=/foo/bar bytes=12345
+        ///   SESSION:DATA:UPLOAD   user=xxx path=/foo/bar bytes=12345
+        ///   SESSION:DATA:DELETE   user=xxx path=/foo/bar
+        ///   SESSION:DATA:MAKEDIR  user=xxx path=/foo/bar
+        ///   SESSION:DATA:REMOVEDIR user=xxx path=/foo/bar
+        ///   SESSION:DATA:RENAME   user=xxx from=/a to=/b
         /// </summary>
         private void ParseSessionEvent(string msg)
         {
+            Console.WriteLine($"[PARSE SESSION] msg={msg}");
+
+            if (msg.StartsWith("SESSION:DATA:"))
+            {
+                HandleDataEvent(msg);
+                return;
+            }
+
             if (msg.StartsWith("SESSION:ONLINE user="))
             {
                 var user = msg.Substring("SESSION:ONLINE user=".Length).Trim();
                 var old = Sessions.FirstOrDefault(s => s.Username == user);
                 if (old != null) Sessions.Remove(old);
+                var since = DateTime.Now;
+                Console.WriteLine($"[PARSE ONLINE] user={user}, OnlineSince={since:yyyy-MM-dd HH:mm:ss}");
                 var sess = new SessionEntryVm
                 {
                     Username = user,
-                    OnlineSince = DateTime.Now,
+                    OnlineSince = since,
                     OpsCount = 0,
                 };
-                sess.TickOnlineFor();  // 立即刷一次，UI 不会先闪 "00:00:00"
+                sess.TickOnlineFor();
                 Sessions.Add(sess);
+                Console.WriteLine($"[PARSE ONLINE DONE] OnlineSince actually = {sess.OnlineSince:yyyy-MM-dd HH:mm:ss}");
             }
             else if (msg.StartsWith("SESSION:OFFLINE user="))
             {
                 var rest = msg.Substring("SESSION:OFFLINE user=".Length).Trim();
                 var user = rest.Split(' ')[0];
+                Console.WriteLine($"[PARSE OFFLINE] user={user}");
                 var old = Sessions.FirstOrDefault(s => s.Username == user);
                 if (old != null) Sessions.Remove(old);
             }
         }
 
+        /// <summary>从 SESSION:DATA:* 原始日志消息里提取 user / path / bytes / from / to 字段。</summary>
+        private static string ExtractField(string msg, string key)
+        {
+            int i = msg.IndexOf(key, StringComparison.Ordinal);
+            if (i < 0) return null;
+            int start = i + key.Length;
+            int end = msg.IndexOf(' ', start);
+            if (end < 0) end = msg.Length;
+            return msg.Substring(start, end - start);
+        }
+        private static ulong ExtractUlongField(string msg, string key)
+        {
+            var s = ExtractField(msg, key);
+            if (string.IsNullOrEmpty(s) || !ulong.TryParse(s, out var v)) return 0;
+            return v;
+        }
+
+        private void HandleDataEvent(string msg)
+        {
+            // DOWNLOAD_COMPLETE / UPLOAD_COMPLETE 是精确统计口径（只统计 start_pos==0 的完整传输，
+            // 避免 FileZilla 断点续传导致 daily_stats 被片段重复累加）
+            if (msg.StartsWith("SESSION:DOWNLOAD_COMPLETE ") || msg.StartsWith("SESSION:UPLOAD_COMPLETE "))
+            {
+                var isDown = msg.StartsWith("SESSION:DOWNLOAD_COMPLETE ");
+                var user1 = ExtractField(msg, "user=");
+                var path1 = ExtractField(msg, "path=") ?? "";
+                var bytes1 = ExtractUlongField(msg, "bytes=");
+                if (!string.IsNullOrEmpty(user1) && bytes1 > 0)
+                {
+                    var entry1 = new TransferEntryVm
+                    {
+                        Time = DateTime.Now,
+                        Username = user1,
+                        Op = isDown ? "DOWNLOAD" : "UPLOAD",
+                        Path = path1,
+                        Bytes = bytes1,
+                    };
+                    Transfers.Insert(0, entry1);
+                    while (Transfers.Count > 500) Transfers.RemoveAt(Transfers.Count - 1);
+
+                    _repo.IncrementDaily(entry1.Time.Date,
+                        isDown ? bytes1 : 0,
+                        !isDown ? bytes1 : 0,
+                        1);
+                    RefreshDashboard();
+                }
+                return;
+            }
+
+            var op = msg.Substring("SESSION:DATA:".Length).Split(' ')[0];
+            var user = ExtractField(msg, "user=");
+            if (string.IsNullOrEmpty(user)) return;
+
+            var entry = new TransferEntryVm
+            {
+                Time = DateTime.Now,
+                Username = user,
+                Op = op,
+            };
+
+            switch (op)
+            {
+                case "DOWNLOAD":
+                case "UPLOAD":
+                    entry.Path = ExtractField(msg, "path=") ?? "";
+                    entry.Bytes = ExtractUlongField(msg, "bytes=");
+                    break;
+                case "DELETE":
+                case "MAKEDIR":
+                case "REMOVEDIR":
+                    entry.Path = ExtractField(msg, "path=") ?? "";
+                    break;
+                case "RENAME":
+                    entry.Path = ExtractField(msg, "from=") ?? "";
+                    var to = ExtractField(msg, "to=");
+                    entry.Extra = string.IsNullOrEmpty(to) ? "" : $"→ {to}";
+                    break;
+                default:
+                    return;
+            }
+
+            Transfers.Insert(0, entry);
+            while (Transfers.Count > 500) Transfers.RemoveAt(Transfers.Count - 1);
+        }
+
         private void Log(string tag, string msg)
         {
             Console.WriteLine($"[VM][{tag}] {msg}");
-            // tag 是字符串，转成 FtpLogLevel
             var level = tag switch
             {
                 "ERROR" => FtpLogLevel.Error,

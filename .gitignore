@@ -25,3 +25,4 @@ publish
 # OS
 Thumbs.db
 .DS_Store
+/website

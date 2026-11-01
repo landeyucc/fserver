@@ -2,11 +2,17 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:FServer.App"
-        Title="FServer FTP 管理" Height="640" Width="920"
-        WindowStartupLocation="CenterScreen">
+        Title="FServer" Height="640" Width="920"
+        MinWidth="720" MinHeight="520"
+        WindowStartupLocation="CenterScreen"
+        Icon="/FServer.Icons;component/ftp.ico">
     <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <local:LogLevelToBrushConverter x:Key="LogLevelToBrush"/>
         <local:EmptyTextOrList x:Key="EmptyTextOrList"/>
+        <local:RatioToWidthConverter x:Key="RatioToWidth"/>
+        <local:TransferOpToBrushConverter x:Key="TransferOpToBrush"/>
+        <local:BytesDisplayConverter x:Key="BytesDisplay"/>
     </Window.Resources>
     <Border Background="{DynamicResource BodyBackgroundGradient}">
         <Grid Margin="8">
@@ -23,6 +29,7 @@
                            Foreground="{DynamicResource HeadingForeground}"
                            VerticalAlignment="Center"/>
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Button Content="关于" Click="AboutBtn_Click" Margin="0,0,8,0" Width="60"/>
                     <Button x:Name="ToggleBtn"
                             Content="{Binding StartStopLabel}"
                             IsEnabled="{Binding ToggleButtonEnabled}"
@@ -78,6 +85,55 @@
                                         <Label Grid.Column="0" Content="最大连接数" VerticalAlignment="Center"/>
                                         <TextBox Grid.Column="1" Text="{Binding MaxConnections, UpdateSourceTrigger=PropertyChanged}" Height="26" VerticalContentAlignment="Center"/>
                                     </Grid>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <!-- 启动行为（Release/Debug 都可见） -->
+                            <GroupBox Header="启动行为" Margin="0,0,0,12">
+                                <StackPanel Margin="10">
+                                    <CheckBox Content="静默启动"
+                                              IsChecked="{Binding SilentStartup, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                              Style="{StaticResource ModernCheckBoxWithLabel}"/>
+                                    <TextBlock Foreground="#64748B" FontSize="11" Margin="24,2,0,8">
+                                        <Run Text="启动时隐藏主窗口，仅托盘运行，关闭主窗口默认仍会最小化到托盘；勾选此项则直接启动到托盘。"/>
+                                    </TextBlock>
+
+                                    <CheckBox Content="开机自启动"
+                                              IsChecked="{Binding AutoStartServer, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                              Style="{StaticResource ModernCheckBoxWithLabel}"/>
+                                    <TextBlock Foreground="#64748B" FontSize="11" Margin="24,2,0,0">
+                                        <Run Text="仅对当前登录用户生效，无需管理员权限；开机后程序将按当前的静默启动行为运行。"/>
+                                    </TextBlock>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Header="被动模式端口范围）" Margin="0,0,0,12"
+                                      Visibility="{Binding IsDebugBuild, Converter={StaticResource BoolToVis}}">
+                                <StackPanel Margin="10">
+                                    <TextBlock Foreground="#64748B" FontSize="11" Text="企业内网/NAT 环境建议固定一个范围（如 50000-60000），并同步在防火墙开放该段。Start 前生效。"/>
+                                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                        <TextBlock Text="最小：" VerticalAlignment="Center" Width="48"/>
+                                        <TextBox Text="{Binding PassiveMinPort, UpdateSourceTrigger=PropertyChanged}"
+                                                 Width="80" Height="26" VerticalContentAlignment="Center"/>
+                                        <TextBlock Text="  最大：" VerticalAlignment="Center" Margin="10,0,0,0" Width="48"/>
+                                        <TextBox Text="{Binding PassiveMaxPort, UpdateSourceTrigger=PropertyChanged}"
+                                                 Width="80" Height="26" VerticalContentAlignment="Center"/>
+                                    </StackPanel>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Header="登录横幅 / MOTD" Margin="0,0,0,12"
+                                      Visibility="{Binding IsDebugBuild, Converter={StaticResource BoolToVis}}">
+                                <StackPanel Margin="10">
+                                    <TextBox Text="{Binding BannerText, UpdateSourceTrigger=PropertyChanged}"
+                                             AcceptsReturn="True"
+                                             Height="80"
+                                             VerticalScrollBarVisibility="Auto"
+                                             TextWrapping="Wrap"
+                                             VerticalContentAlignment="Top"/>
+                                    <TextBlock Foreground="#64748B" FontSize="11" Margin="0,6,0,0">
+                                        FTP 客户端连接时会先收到这条消息，支持多行。修改后重启 FTP 生效。（留空默认 220 Ready）
+                                    </TextBlock>
                                 </StackPanel>
                             </GroupBox>
                         </StackPanel>
@@ -207,90 +263,127 @@
                     </Grid>
                 </TabItem>
 
-                <!-- Tab 3: 日志 -->
+                <!-- Tab 3: 日志（内嵌子 Tab 切换实时/历史） -->
                 <TabItem Header="日志">
-                    <Grid Margin="10">
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="*"/>
-                            <RowDefinition Height="Auto"/>
-                        </Grid.RowDefinitions>
-                        <ListBox x:Name="LogListBox"
-                                 Grid.Row="0"
-                                 ItemsSource="{Binding LogLines}"
-                                 VirtualizingStackPanel.IsVirtualizing="True"
-                                 VirtualizingStackPanel.VirtualizationMode="Recycling"
-                                 ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                                 Background="{DynamicResource ControlBackground}"
-                                 BorderBrush="{DynamicResource ControlBorderBrush}"
-                                 BorderThickness="1">
-                            <ListBox.ItemContainerStyle>
-                                <Style TargetType="ListBoxItem">
-                                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-                                    <Setter Property="Padding" Value="2,0"/>
-                                </Style>
-                            </ListBox.ItemContainerStyle>
-                            <ListBox.ItemTemplate>
-                                <DataTemplate>
-                                    <!-- 两行纵向布局：上=时间+级别标签，下=完整消息 -->
-                                    <Grid Margin="0,3,0,3">
-                                        <Grid.RowDefinitions>
-                                            <RowDefinition Height="Auto"/>
-                                            <RowDefinition Height="Auto"/>
-                                        </Grid.RowDefinitions>
+                    <TabControl Margin="6">
+                        <!-- 子 Tab: 实时日志 -->
+                        <TabItem Header="实时日志">
+                            <Grid Margin="4">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="*"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <ListBox x:Name="LogListBox"
+                                         Grid.Row="0"
+                                         ItemsSource="{Binding LogLines}"
+                                         VirtualizingStackPanel.IsVirtualizing="True"
+                                         VirtualizingStackPanel.VirtualizationMode="Recycling"
+                                         ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                         Background="{DynamicResource ControlBackground}"
+                                         BorderBrush="{DynamicResource ControlBorderBrush}"
+                                         BorderThickness="1">
+                                    <ListBox.ItemContainerStyle>
+                                        <Style TargetType="ListBoxItem">
+                                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                            <Setter Property="Padding" Value="2,0"/>
+                                        </Style>
+                                    </ListBox.ItemContainerStyle>
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <!-- 两行纵向布局：上=时间+级别标签，下=完整消息 -->
+                                            <Grid Margin="0,3,0,3">
+                                                <Grid.RowDefinitions>
+                                                    <RowDefinition Height="Auto"/>
+                                                    <RowDefinition Height="Auto"/>
+                                                </Grid.RowDefinitions>
 
-                                        <!-- 第 1 行：日期时间 + 级别小徽章（紧凑 16px 高） -->
-                                        <StackPanel Grid.Row="0"
-                                                    Orientation="Horizontal"
-                                                    VerticalAlignment="Center">
-                                            <!-- 日期 -->
-                                            <TextBlock Text="{Binding Time, StringFormat=yyyy-MM-dd}"
-                                                       Foreground="#94A3B8"
-                                                       FontFamily="Consolas"
-                                                       FontSize="11"/>
-                                            <TextBlock Text=" "
-                                                       FontFamily="Consolas"
-                                                       FontSize="11"/>
-                                            <!-- 时间 -->
-                                            <TextBlock Text="{Binding Time, StringFormat=HH:mm:ss}"
-                                                       Foreground="#64748B"
-                                                       FontFamily="Consolas"
-                                                       FontSize="11"
-                                                       FontWeight="SemiBold"/>
-                                            <!-- 级别小徽章（左侧带色，White 文字） -->
-                                            <Border Margin="8,0,0,0"
-                                                    Padding="6,1"
-                                                    CornerRadius="3"
-                                                    Background="{Binding Level, Converter={StaticResource LogLevelToBrush}}">
-                                                <TextBlock Text="{Binding Level}"
-                                                           Foreground="White"
+                                                <!-- 第 1 行：日期时间 + 级别小徽章（紧凑 16px 高） -->
+                                                <StackPanel Grid.Row="0"
+                                                            Orientation="Horizontal"
+                                                            VerticalAlignment="Center">
+                                                    <!-- 日期 -->
+                                                    <TextBlock Text="{Binding Time, StringFormat=yyyy-MM-dd}"
+                                                               Foreground="#94A3B8"
+                                                               FontFamily="Consolas"
+                                                               FontSize="11"/>
+                                                    <TextBlock Text=" "
+                                                               FontFamily="Consolas"
+                                                               FontSize="11"/>
+                                                    <!-- 时间 -->
+                                                    <TextBlock Text="{Binding Time, StringFormat=HH:mm:ss}"
+                                                               Foreground="#64748B"
+                                                               FontFamily="Consolas"
+                                                               FontSize="11"
+                                                               FontWeight="SemiBold"/>
+                                                    <!-- 级别小徽章（左侧带色，White 文字） -->
+                                                    <Border Margin="8,0,0,0"
+                                                            Padding="6,1"
+                                                            CornerRadius="3"
+                                                            Background="{Binding Level, Converter={StaticResource LogLevelToBrush}}">
+                                                        <TextBlock Text="{Binding Level}"
+                                                                   Foreground="White"
+                                                                   FontFamily="Consolas"
+                                                                   FontSize="10"
+                                                                   FontWeight="Bold"/>
+                                                    </Border>
+                                                </StackPanel>
+
+                                                <!-- 第 2 行：完整消息（主文本区域，按级别着色） -->
+                                                <TextBlock Grid.Row="1"
+                                                           Text="{Binding Message}"
+                                                           Foreground="{Binding Level, Converter={StaticResource LogLevelToBrush}}"
                                                            FontFamily="Consolas"
-                                                           FontSize="10"
-                                                           FontWeight="Bold"/>
-                                            </Border>
-                                        </StackPanel>
+                                                           FontSize="12"
+                                                           Margin="0,2,0,0"
+                                                           TextWrapping="WrapWithOverflow"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button Content="清空" Click="ClearLog_Click"/>
+                                    <TextBlock Foreground="#64748B"
+                                               VerticalAlignment="Center"
+                                               Margin="12,0,0,0">
+                                        <Run Text="{Binding LogLines.Count, Mode=OneWay}"/>
+                                        <Run Text=" 条日志"/>
+                                    </TextBlock>
+                                </StackPanel>
+                            </Grid>
+                        </TabItem>
 
-                                        <!-- 第 2 行：完整消息（主文本区域，按级别着色） -->
-                                        <TextBlock Grid.Row="1"
-                                                   Text="{Binding Message}"
-                                                   Foreground="{Binding Level, Converter={StaticResource LogLevelToBrush}}"
-                                                   FontFamily="Consolas"
-                                                   FontSize="12"
-                                                   Margin="0,2,0,0"
-                                                   TextWrapping="WrapWithOverflow"/>
-                                    </Grid>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
-                        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,8,0,0">
-                            <Button Content="清空" Click="ClearLog_Click"/>
-                            <TextBlock Foreground="#64748B"
-                                       VerticalAlignment="Center"
-                                       Margin="12,0,0,0">
-                                <Run Text="{Binding LogLines.Count, Mode=OneWay}"/>
-                                <Run Text=" 条日志"/>
-                            </TextBlock>
-                        </StackPanel>
-                    </Grid>
+                        <!-- 子 Tab: 历史日志 -->
+                        <TabItem Header="历史日志">
+                            <Grid Margin="8">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <Button Content="📂 打开日志目录" Click="OpenLogFolder_Click" Width="140"/>
+                                    <Button Content="🔄 刷新" Click="RefreshHistoryLogs_Click" Width="80" Margin="8,0,0,0"/>
+                                </StackPanel>
+                                <DataGrid Grid.Row="1"
+                                          x:Name="HistoryLogGrid"
+                                          ItemsSource="{Binding HistoryLogs}"
+                                          IsReadOnly="True"
+                                          CanUserAddRows="False"
+                                          CanUserDeleteRows="False"
+                                          CanUserResizeColumns="False"
+                                          CanUserSortColumns="False"
+                                          CanUserReorderColumns="False"
+                                          AutoGenerateColumns="False"
+                                          MouseDoubleClick="HistoryLogGrid_DoubleClick">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="文件名" Binding="{Binding Name}" Width="260"/>
+                                        <DataGridTextColumn Header="开始时间" Binding="{Binding StartTime, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="170"/>
+                                        <DataGridTextColumn Header="时长" Binding="{Binding Duration}" Width="110"/>
+                                        <DataGridTextColumn Header="大小" Binding="{Binding SizeDisplay}" Width="90"/>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </TabItem>
+                    </TabControl>
                 </TabItem>
 
                 <!-- Tab 4: 在线会话 -->
@@ -300,7 +393,8 @@
                             <RowDefinition Height="*"/>
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
-                        <DataGrid ItemsSource="{Binding Sessions}"
+                        <DataGrid x:Name="SessionGrid"
+                                  ItemsSource="{Binding Sessions}"
                                   IsReadOnly="True"
                                   CanUserAddRows="False"
                                   CanUserDeleteRows="False"
@@ -308,6 +402,14 @@
                                   CanUserSortColumns="False"
                                   CanUserReorderColumns="False"
                                   AutoGenerateColumns="False">
+                            <DataGrid.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="强制断开此用户" Click="KickSession_Click"
+                                              Foreground="#E53E3E"/>
+                                    <Separator/>
+                                    <MenuItem Header="刷新列表" Click="RefreshSessions_Click"/>
+                                </ContextMenu>
+                            </DataGrid.ContextMenu>
                             <DataGrid.Columns>
                                 <DataGridTextColumn Header="用户名" Binding="{Binding Username}" Width="200"/>
                                 <DataGridTextColumn Header="上线时间" Binding="{Binding OnlineSince, StringFormat=HH:mm:ss}" Width="160"/>
@@ -321,6 +423,155 @@
                             </TextBlock>
                         </StackPanel>
                     </Grid>
+                </TabItem>
+
+                <!-- Tab: 传输活动（Rust 侧 DataListener 推的 DOWNLOAD/UPLOAD/DELETE/...） -->
+                <TabItem Header="传输活动">
+                    <Grid Margin="12">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+                            <Button Content="🧹 清空" Click="ClearTransfers_Click" Width="80"/>
+                            <TextBlock Foreground="#64748B" Margin="12,0,0,0" VerticalAlignment="Center">
+                                <Run Text="{Binding Transfers.Count, Mode=OneWay}"/>
+                                <Run Text=" 条活动（最多保留 500 条）"/>
+                            </TextBlock>
+                        </StackPanel>
+                        <DataGrid Grid.Row="1"
+                                  ItemsSource="{Binding Transfers}"
+                                  IsReadOnly="True"
+                                  CanUserAddRows="False" CanUserDeleteRows="False"
+                                  CanUserResizeColumns="False" CanUserSortColumns="False"
+                                  CanUserReorderColumns="False" AutoGenerateColumns="False">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="时间" Binding="{Binding Time, StringFormat=HH:mm:ss}" Width="80"/>
+                                <DataGridTextColumn Header="操作" Binding="{Binding Op}" Width="100">
+                                    <DataGridTextColumn.ElementStyle>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="{Binding Op, Converter={StaticResource TransferOpToBrush}}"/>
+                                            <Setter Property="FontWeight" Value="SemiBold"/>
+                                        </Style>
+                                    </DataGridTextColumn.ElementStyle>
+                                </DataGridTextColumn>
+                                <DataGridTextColumn Header="用户" Binding="{Binding Username}" Width="140"/>
+                                <DataGridTextColumn Header="大小" Binding="{Binding BytesDisplay}" Width="100"/>
+                                <DataGridTextColumn Header="路径" Binding="{Binding Path}" Width="*"/>
+                                <DataGridTextColumn Header="备注" Binding="{Binding Extra}" Width="120"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
+                </TabItem>
+
+                <!-- Tab: 统计面板 -->
+                <TabItem Header="统计面板">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel Margin="12">
+                            <!-- 顶部操作 -->
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                                <Button Content="🔄 刷新" Click="RefreshDashboard_Click" Width="80"/>
+                                <TextBlock Foreground="#64748B" Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11">
+                                    数据来自 SQLite
+                                </TextBlock>
+                            </StackPanel>
+
+                            <!-- 今日汇总 -->
+                            <GroupBox Header="今日">
+                                <Grid Margin="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" HorizontalAlignment="Left">
+                                        <TextBlock Foreground="#64748B" FontSize="11">下载总量</TextBlock>
+                                        <TextBlock FontSize="20" FontWeight="Bold" Foreground="{DynamicResource HeadingForeground}" Margin="0,4,0,0">
+                                            <Run Text="{Binding TodayBytesDown, Mode=OneWay, Converter={StaticResource BytesDisplay}}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                                        <TextBlock Foreground="#64748B" FontSize="11">上传总量</TextBlock>
+                                        <TextBlock FontSize="20" FontWeight="Bold" Foreground="{DynamicResource HeadingForeground}" Margin="0,4,0,0">
+                                            <Run Text="{Binding TodayBytesUp, Mode=OneWay, Converter={StaticResource BytesDisplay}}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2" HorizontalAlignment="Right">
+                                        <TextBlock Foreground="#64748B" FontSize="11">今日操作数</TextBlock>
+                                        <TextBlock FontSize="20" FontWeight="Bold" Foreground="{DynamicResource HeadingForeground}" Margin="0,4,0,0">
+                                            <Run Text="{Binding TodayTotalOps, Mode=OneWay}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Grid>
+                            </GroupBox>
+
+                            <!-- 7 天汇总 -->
+                            <GroupBox Header="近 7 天">
+                                <Grid Margin="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Foreground="#64748B" FontSize="11">下载合计</TextBlock>
+                                        <TextBlock FontSize="16" FontWeight="Bold" Margin="0,2,0,0">
+                                            <Run Text="{Binding TotalBytesDown7d, Mode=OneWay, Converter={StaticResource BytesDisplay}}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Foreground="#64748B" FontSize="11">上传合计</TextBlock>
+                                        <TextBlock FontSize="16" FontWeight="Bold" Margin="0,2,0,0">
+                                            <Run Text="{Binding TotalBytesUp7d, Mode=OneWay, Converter={StaticResource BytesDisplay}}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Foreground="#64748B" FontSize="11">操作次数</TextBlock>
+                                        <TextBlock FontSize="16" FontWeight="Bold" Margin="0,2,0,0">
+                                            <Run Text="{Binding TotalOps7d, Mode=OneWay}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="3">
+                                        <TextBlock Foreground="#64748B" FontSize="11">单日峰值</TextBlock>
+                                        <TextBlock FontSize="16" FontWeight="Bold" Margin="0,2,0,0">
+                                            <Run Text="{Binding PeakBytesDay7d, Mode=OneWay, Converter={StaticResource BytesDisplay}}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Grid>
+                            </GroupBox>
+
+                            <!-- 近 7 天柱状图 -->
+                            <GroupBox Header="近 7 天传输量">
+                                <StackPanel>
+                                    <ItemsControl ItemsSource="{Binding DashboardBars}" Margin="10,8,10,2">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <StackPanel Orientation="Horizontal" Margin="0,2,0,2">
+                                                    <!-- 日期标签 -->
+                                                    <TextBlock Text="{Binding Label}" Width="56" VerticalAlignment="Center"
+                                                               Foreground="#64748B" FontSize="11" FontFamily="Consolas"/>
+                                                    <!-- 条形区：固定宽 300 -->
+                                                    <Border Width="300" Height="18" Background="#E2E8F0"
+                                                            CornerRadius="3" Margin="6,0,6,0">
+                                                        <Rectangle HorizontalAlignment="Left" Height="18"
+                                                                   Fill="#3B82F6"
+                                                                   Width="{Binding Ratio, Converter={StaticResource RatioToWidth}, ConverterParameter=300}"/>
+                                                    </Border>
+                                                    <!-- 数值 -->
+                                                    <TextBlock Text="{Binding TotalDisplay}" Width="80"
+                                                               VerticalAlignment="Center"
+                                                               Foreground="{DynamicResource HeadingForeground}"/>
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <TextBlock Foreground="#94A3B8" FontSize="11" Margin="120,0,0,8" Text="条形长度=当天传输量相对 7 天峰值的比例"/>
+                                </StackPanel>
+                            </GroupBox>
+                        </StackPanel>
+                    </ScrollViewer>
                 </TabItem>
             </TabControl>
 

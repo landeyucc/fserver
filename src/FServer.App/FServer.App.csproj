@@ -10,11 +10,11 @@
     <LangVersion>latest</LangVersion>
     <PlatformTarget>x64</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
+    <ApplicationIcon>ftp.ico</ApplicationIcon>
   </PropertyGroup>
 
   <!-- 自动触发 cargo build：先判断 cargo 是否存在 + DLL 是否需要重建 -->
   <PropertyGroup>
-    <!-- 注意：cargo 默认 target 目录相对于 crate 根 -->
     <FtpCoreDll Condition="'$(FtpCoreDll)' == ''">..\..\rust\ftp_core\target\x86_64-pc-windows-msvc\release\ftp_core.dll</FtpCoreDll>
     <FtpCoreSourceDir>..\..\rust\ftp_core\src</FtpCoreSourceDir>
   </PropertyGroup>
@@ -26,7 +26,6 @@
   <Target Name="BuildFtpCore" BeforeTargets="BeforeCompile" Inputs="$(FtpCoreSourceDir)\**\*.rs;..\..\rust\ftp_core\Cargo.toml" Outputs="$(FtpCoreDll)">
     <Message Text="Building Rust ftp_core..." Importance="high" />
     <Exec Command="cargo build --release --target x86_64-pc-windows-msvc" WorkingDirectory="..\..\rust\ftp_core" ConsoleToMsBuild="true" />
-    <!-- cargo 默认产物名：ftp_core.dll (因为 crate-type=cdylib, crate-name=ftp_core) -->
     <Exec Command="if NOT EXIST $(FtpCoreDll) echo ERROR: ftp_core.dll not built at $(FtpCoreDll) &amp; exit /b 1" ConsoleToMsBuild="true" />
   </Target>
 
@@ -36,6 +35,11 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="6.0.25" />
+    <PackageReference Include="System.Text.Json" Version="6.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FServer.Icons\FServer.Icons.csproj" />
   </ItemGroup>
 
 </Project>

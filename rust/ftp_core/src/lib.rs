@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use libunftp::ServerBuilder;
+use libunftp::notification::{DataEvent, DataListener, EventMeta, PresenceEvent, PresenceListener};
 use unftp_core::auth::{Authenticator, AuthenticationError, Credentials, Principal, UserDetail, UserDetailError, UserDetailProvider};
-use unftp_core::storage::{Error as StorageError, ErrorKind, Fileinfo, Result as StorageResult, StorageBackend};
+use unftp_core::storage::{Error as StorageError, ErrorKind, Fileinfo, Metadata, Result as StorageResult, StorageBackend};
 use unftp_sbe_fs::{Filesystem, Meta};
 use unftp_sbe_rooter::{RooterVfs, UserWithRoot};
 use tokio::sync::oneshot;
@@ -75,16 +76,44 @@ struct SessionInfo {
     ops_count: u64,
 }
 
+type Logger = Arc<dyn Fn(c_int, &str) + Send + Sync>;
+
 #[derive(Clone)]
 struct SessionRegistry {
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
-    logger: Arc<dyn Fn(c_int, &str) + Send + Sync>,
+    logger: Logger,
+}
+
+impl Debug for SessionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRegistry").finish_non_exhaustive()
+    }
 }
 
 impl SessionRegistry {
-    fn new(logger: Arc<dyn Fn(c_int, &str) + Send + Sync>) -> Self {
+    fn new(logger: Logger) -> Self {
         Self { sessions: Arc::new(Mutex::new(HashMap::new())), logger }
     }
+
+    /// 用已有的 Arc<Mutex<HashMap>> 构造新实例（多实例共享同一张表，各自独立 logger）
+    fn with_existing_map(sessions: Arc<Mutex<HashMap<String, SessionInfo>>>, logger: Logger) -> Self {
+        Self { sessions, logger }
+    }
+
+    /// 拿出底层 Arc<Mutex<HashMap>> —— run_server 里要给 SimpleAuth / ReadOnlyWrapper / PresenceListener / cleanup 各 Clone 一份
+    fn inner(&self) -> Arc<Mutex<HashMap<String, SessionInfo>>> {
+        Arc::clone(&self.sessions)
+    }
+
+    /// 运行时替换 logger（ftp_server_start 里 spawn worker 前注入 P/Invoke 真实 logger）
+    fn set_logger(&mut self, new_logger: Logger) {
+        self.logger = new_logger;
+    }
+
+    fn exists(&self, username: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(username)
+    }
+
     fn on_login(&self, username: &str) {
         let now = Instant::now();
         let mut g = self.sessions.lock().unwrap();
@@ -98,6 +127,14 @@ impl SessionRegistry {
         drop(g);
         if is_new { (self.logger)(4, &format!("SESSION:ONLINE user={}", username)); }
     }
+
+    fn on_logout(&self, username: &str) {
+        let mut g = self.sessions.lock().unwrap();
+        if g.remove(username).is_some() {
+            (self.logger)(4, &format!("SESSION:OFFLINE user={} (logout)", username));
+        }
+    }
+
     fn on_op(&self, username: &str) {
         let mut g = self.sessions.lock().unwrap();
         if let Some(s) = g.get_mut(username) {
@@ -105,15 +142,27 @@ impl SessionRegistry {
             s.ops_count += 1;
         }
     }
+
     fn remove(&self, username: &str) {
         let mut g = self.sessions.lock().unwrap();
         if g.remove(username).is_some() {
             (self.logger)(4, &format!("SESSION:OFFLINE user={} (idle)", username));
         }
     }
+
+    /// 强制踢掉：先从 HashMap remove，再打 SESSION:KICK 事件
+    fn kick(&self, username: &str) -> bool {
+        let mut g = self.sessions.lock().unwrap();
+        if g.remove(username).is_some() {
+            drop(g);
+            (self.logger)(4, &format!("SESSION:KICK user={} (admin)", username));
+            true
+        } else {
+            false
+        }
+    }
+
     /// idle 清理：idle 超过 30 秒踢掉。
-    /// 返回一个 Future，需要在 Tokio runtime 里 await（不能用 tokio::spawn，
-    /// 因为调用点不在 runtime context 里）。
     async fn idle_cleanup(self, mut stop: broadcast::Receiver<()>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -136,12 +185,75 @@ impl SessionRegistry {
     }
 }
 
-/// StorageBackend wrapper：审计日志 + 只读拦截 + session 刷新
+// ──────────────────────────────────────────────
+// libunftp PresenceListener：登录/登出自动触发
+// ──────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct SimplePresenceListener {
+    sessions: SessionRegistry,
+}
+
+#[async_trait::async_trait]
+impl PresenceListener for SimplePresenceListener {
+    async fn receive_presence_event(&self, e: PresenceEvent, m: EventMeta) {
+        // m.username 是登录名（干净的原始名，不带 AUTHED:/ANON: 前缀）
+        match e {
+            PresenceEvent::LoggedIn => self.sessions.on_login(&m.username),
+            PresenceEvent::LoggedOut => self.sessions.on_logout(&m.username),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// libunftp DataListener：上传/下载/删除/重命名事件
+// ──────────────────────────────────────────────
+
+#[derive(Clone)]
+struct SimpleDataListener {
+    logger: Logger,
+}
+
+impl Debug for SimpleDataListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleDataListener").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl DataListener for SimpleDataListener {
+    async fn receive_data_event(&self, e: DataEvent, m: EventMeta) {
+        // m.username 是登录名（干净的原始名，不带 AUTHED:/ANON: 前缀）
+        // 所有 DataEvent 统一走 level=4（SESSION 通道），C# 侧 ParseSessionEvent 统一解析
+        match e {
+            DataEvent::Got { path, bytes } => {
+                (self.logger)(4, &format!("SESSION:DATA:DOWNLOAD user={} path={} bytes={}", m.username, path, bytes));
+            }
+            DataEvent::Put { path, bytes } => {
+                (self.logger)(4, &format!("SESSION:DATA:UPLOAD user={} path={} bytes={}", m.username, path, bytes));
+            }
+            DataEvent::Deleted { path } => {
+                (self.logger)(4, &format!("SESSION:DATA:DELETE user={} path={}", m.username, path));
+            }
+            DataEvent::MadeDir { path } => {
+                (self.logger)(4, &format!("SESSION:DATA:MAKEDIR user={} path={}", m.username, path));
+            }
+            DataEvent::RemovedDir { path } => {
+                (self.logger)(4, &format!("SESSION:DATA:REMOVEDIR user={} path={}", m.username, path));
+            }
+            DataEvent::Renamed { from, to } => {
+                (self.logger)(4, &format!("SESSION:DATA:RENAME user={} from={} to={}", m.username, from, to));
+            }
+        }
+    }
+}
+
+/// StorageBackend wrapper：审计日志 + 只读拦截 + session 刷新 + kick 后拒绝
 
 #[derive(Clone)]
 struct ReadOnlyWrapper<S> {
     inner: S,
-    logger: Arc<dyn Fn(c_int, &str) + Send + Sync>,
+    logger: Logger,
     sessions: SessionRegistry,
 }
 
@@ -152,7 +264,7 @@ impl<S: std::fmt::Debug> std::fmt::Debug for ReadOnlyWrapper<S> {
 }
 
 impl<S> ReadOnlyWrapper<S> {
-    fn new(inner: S, logger: Arc<dyn Fn(c_int, &str) + Send + Sync>, sessions: SessionRegistry) -> Self {
+    fn new(inner: S, logger: Logger, sessions: SessionRegistry) -> Self {
         Self { inner, logger, sessions }
     }
 
@@ -160,12 +272,19 @@ impl<S> ReadOnlyWrapper<S> {
     fn log(&self, level: c_int, msg: &str) { (self.logger)(level, msg); }
 
     /// 判断这个 StorageError 是不是"客户端正常关闭数据连接"造成的。
-    /// FTP 客户端在文件传完后会主动 FIN/RST 数据连接（或 FileZilla 有时直接 RST），
-    /// tokio::io::copy 因此返回 BrokenPipe/ConnectionReset → 被映射成 ErrorKind::ConnectionClosed。
-    /// 这属于正常收尾，不是真正的传输失败。
     #[inline]
     fn is_client_conn_closed(e: &StorageError) -> bool {
         matches!(e.kind(), ErrorKind::ConnectionClosed)
+    }
+
+    /// 强制踢人后客户端还能继续操作的防御：如果会话已被清理，直接 PermissionDenied（→ FTP 530）
+    #[inline]
+    fn ensure_alive(&self, user: &AppUser, op: &str) -> StorageResult<()> {
+        if !self.sessions.exists(&user.username) {
+            self.log(2, &format!("操作拒绝：用户「{}」会话已被清理（可能被强制断开）→ {}", user.username, op));
+            return Err(StorageError::new(ErrorKind::PermissionDenied, "session cleared by admin"));
+        }
+        Ok(())
     }
 
     #[inline]
@@ -189,8 +308,9 @@ where
     fn name(&self) -> &str { self.inner.name() }
     fn supported_features(&self) -> u32 { self.inner.supported_features() }
 
-    // ── 读操作：成功 + 失败都打（但措辞精确，避免笼统"下载"混淆加载目录列表）──
+    // ── 读操作 ──
     async fn metadata<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P) -> StorageResult<Self::Metadata> {
+        self.ensure_alive(user, "metadata")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         self.inner.metadata(user, path).await.inspect_err(|e| {
@@ -198,6 +318,7 @@ where
         })
     }
     async fn list<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P) -> StorageResult<Vec<Fileinfo<PathBuf, Self::Metadata>>> {
+        self.ensure_alive(user, "list")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         let r = self.inner.list(user, path).await;
@@ -209,11 +330,25 @@ where
     }
     async fn get_into<'a, P, W: ?Sized>(&self, user: &AppUser, path: P, start_pos: u64, output: &'a mut W) -> StorageResult<u64>
     where W: tokio::io::AsyncWrite + Unpin + Sync + Send, P: AsRef<Path> + Send + Debug {
+        self.ensure_alive(user, "retr")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
+
+        // 预取文件总大小（用于统计面板"完整文件流量"口径；续传时 DataListener 会多次累加片段，
+        // 但 daily_stats 应以 start_pos==0 的完整传输为准）
+        let total_size = self.inner.metadata(user, &p).await.map(|m| m.len()).unwrap_or(0);
+
         let r = self.inner.get_into(user, path, start_pos, output).await;
         match &r {
-            Ok(sz) => self.log(1, &format!("下载成功：用户「{}」下载 {:?}（{} 字节）", user.username, p, sz)),
+            Ok(sz) => {
+                self.log(1, &format!("下载成功：用户「{}」下载 {:?}（{} 字节，总大小 {}，start_pos={}）", user.username, p, sz, total_size, start_pos));
+                // 精确统计：只在 start_pos==0 时发 DOWNLOAD_COMPLETE（完整文件）；
+                // 续传片段（start_pos!=0）仍会被 libunftp DataListener 触发 DOWNLOAD 事件进传输活动 Tab，
+                // 但不会被 daily_stats 二次累加。
+                if start_pos == 0 {
+                    self.log(4, &format!("SESSION:DOWNLOAD_COMPLETE user={} path={} bytes={} total_size={}", user.username, p.display(), sz, total_size));
+                }
+            }
             Err(e) if Self::is_client_conn_closed(e) => {
                 self.log(1, &format!("下载结束：用户「{}」{:?} 数据连接关闭（可能为正常收尾）", user.username, p));
             }
@@ -222,6 +357,7 @@ where
         r
     }
     async fn get<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P, start_pos: u64) -> StorageResult<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>> {
+        self.ensure_alive(user, "retr")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         let r = self.inner.get(user, path, start_pos).await;
@@ -235,6 +371,7 @@ where
         r
     }
     async fn cwd<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P) -> StorageResult<()> {
+        self.ensure_alive(user, "cwd")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         let r = self.inner.cwd(user, path).await;
@@ -245,15 +382,22 @@ where
         r
     }
 
-    // ── 写操作：成功 + 拒绝 + 失败都打 ──
+    // ── 写操作 ──
     async fn put<P: AsRef<Path> + Send + Debug, R: tokio::io::AsyncRead + Send + Sync + Unpin + 'static>(
         &self, user: &AppUser, input: R, path: P, start_pos: u64) -> StorageResult<u64> {
+        self.ensure_alive(user, "stor")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         self.deny_if_readonly(user, "STOR", "上传文件")?;
         let r = self.inner.put(user, input, path, start_pos).await;
         match &r {
-            Ok(sz) => self.log(1, &format!("上传成功：用户「{}」{:?} 大小 {} 字节", user.username, p, sz)),
+            Ok(sz) => {
+                self.log(1, &format!("上传成功：用户「{}」{:?} 大小 {} 字节，start_pos={}", user.username, p, sz, start_pos));
+                // 精确统计：新增文件（start_pos==0）才算完整上传，追加写不重复计数
+                if start_pos == 0 {
+                    self.log(4, &format!("SESSION:UPLOAD_COMPLETE user={} path={} bytes={}", user.username, p.display(), sz));
+                }
+            }
             Err(e) if Self::is_client_conn_closed(e) => {
                 self.log(1, &format!("上传结束：用户「{}」{:?} 数据连接关闭（可能为正常收尾）", user.username, p));
             }
@@ -262,6 +406,7 @@ where
         r
     }
     async fn del<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P) -> StorageResult<()> {
+        self.ensure_alive(user, "dele")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         self.deny_if_readonly(user, "DELE", "删除文件")?;
@@ -273,6 +418,7 @@ where
         r
     }
     async fn mkd<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P) -> StorageResult<()> {
+        self.ensure_alive(user, "mkd")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         self.deny_if_readonly(user, "MKD", "创建目录")?;
@@ -284,6 +430,7 @@ where
         r
     }
     async fn rmd<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, path: P) -> StorageResult<()> {
+        self.ensure_alive(user, "rmd")?;
         let p = path.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
         self.deny_if_readonly(user, "RMD", "删除目录")?;
@@ -295,6 +442,7 @@ where
         r
     }
     async fn rename<P: AsRef<Path> + Send + Debug>(&self, user: &AppUser, from: P, to: P) -> StorageResult<()> {
+        self.ensure_alive(user, "rnfr")?;
         let f = from.as_ref().to_path_buf();
         let t = to.as_ref().to_path_buf();
         self.sessions.on_op(&user.username);
@@ -311,9 +459,12 @@ where
 pub struct FtpServer {
     port: Mutex<u16>,
     root_dir: Mutex<PathBuf>,
-    #[allow(dead_code)]
     passive_port_range: Mutex<(u16, u16)>,
+    greeting: Mutex<String>,
     users: Mutex<HashMap<String, UserEntry>>,
+
+    /// 所有 worker / SimplePresenceListener / ReadOnlyWrapper / cleanup 共享同一张表
+    sessions: SessionRegistry,
 
     log_cb: Mutex<LogCallback>,
     log_ctx: Mutex<*mut c_void>,
@@ -331,7 +482,10 @@ impl FtpServer {
             port: Mutex::new(2121),
             root_dir: Mutex::new(PathBuf::from(".")),
             passive_port_range: Mutex::new((50000, 60000)),
+            greeting: Mutex::new(String::new()),
             users: Mutex::new(HashMap::new()),
+            // 占位 logger；ftp_server_start 里 spawn 前 set_logger 换成真实的
+            sessions: SessionRegistry::new(Arc::new(|_lvl, _msg| {})),
             log_cb: Mutex::new(None),
             log_ctx: Mutex::new(std::ptr::null_mut()),
             running: Arc::new(AtomicBool::new(false)),
@@ -351,7 +505,7 @@ impl FtpServer {
     }
 }
 
-// ---- Authenticator: 永远放行（实现 anonymous 模式）
+// ---- Authenticator：永远放行（实现 anonymous 模式）
 // 标记规则：Principal.username 带前缀
 //   "AUTHED:original_name" → 已验证密码正确
 //   "ANON:original_name"   → 用户不存在 / 密码错误 → UserDetailProvider 会映射到 guest
@@ -359,8 +513,7 @@ impl FtpServer {
 #[derive(Clone)]
 struct SimpleAuth {
     users: Arc<Mutex<HashMap<String, UserEntry>>>,
-    logger: Arc<dyn Fn(c_int, &str) + Send + Sync>,
-    sessions: SessionRegistry,
+    logger: Logger,
 }
 
 impl std::fmt::Debug for SimpleAuth {
@@ -385,33 +538,28 @@ impl Authenticator for SimpleAuth {
             Some(u) if u.enabled && u.password == password => {
                 (self.logger)(1, &format!("登录成功：用户「{}」（已注册）", username));
                 drop(guard);
-                self.sessions.on_login(username);
+                // 注：on_login 已由 SimplePresenceListener（PresenceEvent::LoggedIn）统一触发，
+                // 不要在这里手动调——否则会产生双 ONLINE 事件
                 Ok(Principal { username: format!("{}{}", AUTHED_PREFIX, username) })
             }
             Some(u) if !u.enabled => {
-                // 用户存在但被禁用 → 直接拒绝（不泄露"用户存在但禁用"，按 FTP 规范统一回 530）
                 (self.logger)(2, &format!("登录拒绝：用户「{}」已被禁用", username));
                 Err(AuthenticationError::new("user disabled"))
             }
             Some(_) => {
-                // 用户存在但密码错误 → guest 兜底（guest 禁用则 guest 兜底也拒绝）
                 if let Some(guest) = guard.get("guest") {
                     if !guest.enabled {
                         (self.logger)(2, &format!("登录拒绝：用户「{}」密码错误且访客（guest）已禁用", username));
                         return Err(AuthenticationError::new("guest unavailable"));
                     }
                 } else {
-                    // guest 根本没配置 → 任何未知用户都应拒绝
                     (self.logger)(2, &format!("登录拒绝：用户「{}」密码错误，且没有可用的访客账号", username));
                     return Err(AuthenticationError::new("no guest account"));
                 }
                 (self.logger)(2, &format!("登录失败：用户「{}」密码错误，以访客身份处理", username));
-                drop(guard);
-                self.sessions.on_login(username);
                 Ok(Principal { username: format!("{}{}", ANON_PREFIX, username) })
             }
             None => {
-                // 用户不存在 → guest 兜底（guest 禁用则 guest 兜底也拒绝）
                 if let Some(guest) = guard.get("guest") {
                     if !guest.enabled {
                         (self.logger)(2, &format!("登录拒绝：用户「{}」不存在且访客（guest）已禁用", username));
@@ -422,8 +570,6 @@ impl Authenticator for SimpleAuth {
                     return Err(AuthenticationError::new("no guest account"));
                 }
                 (self.logger)(2, &format!("登录失败：用户「{}」不存在，以访客身份处理", username));
-                drop(guard);
-                self.sessions.on_login(username);
                 Ok(Principal { username: format!("{}{}", ANON_PREFIX, username) })
             }
         }
@@ -431,8 +577,6 @@ impl Authenticator for SimpleAuth {
 }
 
 // ---- UserDetailProvider: 根据 Authenticator 的前缀标记决定用谁的权限
-// AUTHED:xxx → 用 xxx 自己的 root/read_only
-// ANON:xxx   → 用 guest 的 root/read_only（guest 必须存在，否则 fallback 到 None→全局 root）
 
 #[derive(Debug, Clone)]
 struct AppUserProvider {
@@ -445,7 +589,6 @@ fn extract_username(principal: &Principal) -> (&str, bool /* authed */) {
     } else if let Some(name) = principal.username.strip_prefix(ANON_PREFIX) {
         (name, false)
     } else {
-        // 没有前缀的旧调用，当作 AUTHED 对待（向后兼容）
         (principal.username.as_str(), true)
     }
 }
@@ -459,7 +602,6 @@ impl UserDetailProvider for AppUserProvider {
         let guard = self.users.lock().unwrap();
 
         if authed {
-            // 密码验证通过 → 用该用户自己的配置
             match guard.get(name) {
                 Some(u) => Ok(AppUser {
                     username: name.to_string(),
@@ -472,26 +614,25 @@ impl UserDetailProvider for AppUserProvider {
                 }
             }
         } else {
-            // 未授权 → 映射到 guest（guest 不存在就用匿名配置：None→全局root）
             eprintln!("[ftp_core] ANON login user={} → treat as guest", name);
             Ok(resolve_guest(&guard, name))
         }
     }
 }
 
-/// 查 guest 的配置；找不到就返回匿名只读配置（read_only=true + root=None→全局root）
+/// 查 guest 的配置；找不到就返回匿名只读配置
 fn resolve_guest<'a>(guard: &'a std::sync::MutexGuard<'a, HashMap<String, UserEntry>>,
                      anon_username: &str) -> AppUser {
     match guard.get("guest") {
         Some(g) => AppUser {
             username: format!("{} (as guest)", anon_username),
             root: g.root.clone(),
-            read_only: true, // ANON 一律只读，强制
+            read_only: true,
         },
         None => AppUser {
             username: format!("{} (anonymous)", anon_username),
-            root: None,      // RooterVfs 里会 fallback 到全局 root_dir
-            read_only: true, // 匿名一律只读
+            root: None,
+            read_only: true,
         },
     }
 }
@@ -540,6 +681,39 @@ pub unsafe extern "C" fn ftp_server_set_max_conn(handle: *mut FtpServer, _n: u32
     0
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ftp_server_set_greeting(handle: *mut FtpServer, banner: *const c_char) -> c_int {
+    if handle.is_null() { return -1; }
+    let srv = &*handle;
+    if srv.running.load(Ordering::Relaxed) { return -2; }
+    let banner_str = if banner.is_null() {
+        String::new()
+    } else {
+        match CStr::from_ptr(banner).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -3,
+        }
+    };
+    *srv.greeting.lock().unwrap() = banner_str;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ftp_server_set_passive_port_range(handle: *mut FtpServer, min: c_int, max: c_int) -> c_int {
+    if handle.is_null() { return -1; }
+    let srv = &*handle;
+    if srv.running.load(Ordering::Relaxed) { return -2; }
+    let (lo, hi) = if min == 0 && max == 0 {
+        (0u16, 0u16) // 0 表示不限制（让 OS 分配）
+    } else if min < 1024 || max < 1024 || min > 65535 || max > 65535 || min > max {
+        return -3;
+    } else {
+        (min as u16, max as u16)
+    };
+    *srv.passive_port_range.lock().unwrap() = (lo, hi);
+    0
+}
+
 /// 基础版本（向后兼容），默认 enabled=1
 #[no_mangle]
 pub unsafe extern "C" fn ftp_server_add_user(
@@ -551,9 +725,6 @@ pub unsafe extern "C" fn ftp_server_add_user(
     ftp_server_add_user_ex(handle, user, pass, readonly, std::ptr::null(), 1)
 }
 
-/// 完整版：允许为用户指定专属根路径 + 是否启用
-///   root == NULL 或空串 → 退回到全局默认
-///   enabled == 0 → 禁用；密码对的用户也直接拒绝登录
 #[no_mangle]
 pub unsafe extern "C" fn ftp_server_add_user_with_root(
     handle: *mut FtpServer,
@@ -565,7 +736,6 @@ pub unsafe extern "C" fn ftp_server_add_user_with_root(
     ftp_server_add_user_ex(handle, user, pass, readonly, root, 1)
 }
 
-/// 内部扩展版：enabled 参数
 #[no_mangle]
 pub unsafe extern "C" fn ftp_server_add_user_ex(
     handle: *mut FtpServer,
@@ -609,6 +779,14 @@ pub unsafe extern "C" fn ftp_server_clear_users(handle: *mut FtpServer) -> c_int
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ftp_server_kick_session(handle: *mut FtpServer, user: *const c_char) -> c_int {
+    if handle.is_null() || user.is_null() { return -1; }
+    let srv = &*handle;
+    let u = match CStr::from_ptr(user).to_str() { Ok(s) => s, Err(_) => return -2 };
+    if srv.sessions.kick(u) { 0 } else { -2 }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ftp_server_set_log_cb(
     handle: *mut FtpServer,
     cb: LogCallback,
@@ -630,6 +808,8 @@ pub unsafe extern "C" fn ftp_server_start(handle: *mut FtpServer) -> c_int {
     let port = *srv.port.lock().unwrap();
     let root = srv.root_dir.lock().unwrap().clone();
     let users = Arc::new(Mutex::new(srv.users.lock().unwrap().clone()));
+    let greeting = srv.greeting.lock().unwrap().clone();
+    let passive_range = *srv.passive_port_range.lock().unwrap();
     if !root.exists() {
         srv.emit_log(3, &format!("root dir invalid: {:?}", root));
         return -3;
@@ -642,9 +822,23 @@ pub unsafe extern "C" fn ftp_server_start(handle: *mut FtpServer) -> c_int {
     let running = Arc::clone(&srv.running);
     let log_cb = *srv.log_cb.lock().unwrap();
     let log_ctx = *srv.log_ctx.lock().unwrap();
-    // 函数指针和 raw ptr 都是 !Send，用 usize 绕一下
     let log_cb_addr = log_cb.map(|f| f as usize).unwrap_or(0usize);
     let log_ctx_addr = log_ctx as usize;
+
+    // 构造 logger closure（Send + Sync，内部通过 usize transmute 回函数指针）
+    let pre_logger: Logger = Arc::new(move |level: c_int, msg: &str| {
+        let cb: LogCallback = if log_cb_addr != 0 {
+            Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(c_int, *const c_char, *mut c_void)>(log_cb_addr) })
+        } else { None };
+        let ctx = log_ctx_addr as *mut c_void;
+        emit(&cb, ctx, level, msg);
+    });
+
+    // 关键：让 FtpServer 持有的 sessions 也换成真实 logger，
+    // 这样 kick_session 打的 SESSION:KICK/OFFLINE 事件能走到 C# 侧
+    // FtpServer 已声明 Send + Sync，且此时还没 spawn worker，无并发冲突
+    let srv_mut = handle as *mut FtpServer;
+    unsafe { (*srv_mut).sessions.set_logger(pre_logger.clone()); }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let running_clone = running.clone();
@@ -659,11 +853,9 @@ pub unsafe extern "C" fn ftp_server_start(handle: *mut FtpServer) -> c_int {
             } else { None };
             let ctx = log_ctx_addr as *mut c_void;
 
-            // ── 1. 安装 panic hook：任何 Rust panic 先转 ERROR 日志再 abort ──
-            // （无论 Release abort 还是 Debug unwind，hook 都会被调用；
-            //   abort 模式下 hook 跑完才终止进程，所以 C# 侧一定能收到最后一条 PANIC 日志）
+            // panic hook
             {
-                let cb_addr = log_cb_addr;  // usize 已是 Send + Sync
+                let cb_addr = log_cb_addr;
                 let ctx_addr = log_ctx_addr;
                 panic::set_hook(Box::new(move |info| {
                     let msg = format!(
@@ -671,9 +863,7 @@ pub unsafe extern "C" fn ftp_server_start(handle: *mut FtpServer) -> c_int {
                         info.payload().downcast_ref::<&str>().cloned().unwrap_or("<unknown>"),
                         info.location().map(|l| format!("at {}:{}", l.file(), l.line())).unwrap_or_default(),
                     );
-                    // 先打到 stderr（Debug 控制台必现）
                     eprintln!("{}", msg);
-                    // 再推给 C# 侧日志（level=3 错误），usize → transmute 回来
                     let cb: LogCallback = if cb_addr != 0 {
                         Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(c_int, *const c_char, *mut c_void)>(cb_addr) })
                     } else { None };
@@ -695,6 +885,7 @@ pub unsafe extern "C" fn ftp_server_start(handle: *mut FtpServer) -> c_int {
             run_server(
                 rt, &cb_opt, ctx, &log_cb_addr, &log_ctx_addr,
                 &running_clone, &users, &root, &bind_str, &root_display,
+                greeting, passive_range,
                 shutdown_rx,
             );
 
@@ -717,7 +908,7 @@ pub unsafe extern "C" fn ftp_server_start(handle: *mut FtpServer) -> c_int {
     0
 }
 
-/// FTP worker 主循环。内部任何 panic 都会先经 hook 转 ERROR 日志，然后 abort。
+/// FTP worker 主循环
 fn run_server(
     rt: tokio::runtime::Runtime,
     cb_opt: &LogCallback,
@@ -729,12 +920,13 @@ fn run_server(
     root: &PathBuf,
     bind_str: &str,
     root_display: &str,
+    greeting: String,
+    passive_port_range: (u16, u16),
     shutdown_rx: oneshot::Receiver<()>,
 ) {
-    // 统一 logger closure
     let cb_addr = *log_cb_addr;
     let ctx_addr = *log_ctx_addr;
-    let logger: Arc<dyn Fn(c_int, &str) + Send + Sync> = Arc::new(move |level: c_int, msg: &str| {
+    let logger: Logger = Arc::new(move |level: c_int, msg: &str| {
         let cb: LogCallback = if cb_addr != 0 {
             Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(c_int, *const c_char, *mut c_void)>(cb_addr) })
         } else { None };
@@ -743,29 +935,61 @@ fn run_server(
     });
 
     let root_for_factory = root.clone();
-    let sessions = SessionRegistry::new(logger.clone());
 
-    let sessions_for_factory = sessions.clone();
+    // 核心：创建唯一的 SessionRegistry，然后 with_existing_map 分发给所有需要它的组件
+    let sessions = SessionRegistry::new(logger.clone());
+    let sessions_inner = sessions.inner();
+
+    // 日志里显示被动端口配置
+    match passive_port_range {
+        (0, 0) => emit(cb_opt, ctx, 1, "被动端口范围: 不限制（由 OS 分配）"),
+        (lo, hi) => emit(cb_opt, ctx, 1, &format!("被动端口范围: {} - {}", lo, hi)),
+    }
+
+    let factory_sessions = SessionRegistry::with_existing_map(Arc::clone(&sessions_inner), logger.clone());
     let logger_for_factory = logger.clone();
     let factory: Box<dyn (Fn() -> ReadOnlyWrapper<RooterVfs<Filesystem, AppUser, Meta>>) + Send + Sync> =
         Box::new(move || {
             let fs = Filesystem::new(root_for_factory.clone())
                 .expect("Filesystem factory failed");
             let rooter = RooterVfs::<Filesystem, AppUser, Meta>::new(fs);
-            ReadOnlyWrapper::new(rooter, logger_for_factory.clone(), sessions_for_factory.clone())
+            ReadOnlyWrapper::new(rooter, logger_for_factory.clone(), factory_sessions.clone())
         });
 
-    let auth = SimpleAuth { users: Arc::clone(users), logger: logger.clone(), sessions: sessions.clone() };
+    let auth = SimpleAuth { users: Arc::clone(users), logger: logger.clone() };
     let provider = AppUserProvider { users: Arc::clone(users) };
 
-    let server = ServerBuilder::with_user_detail_provider(factory, Arc::new(provider))
+    // PresenceListener —— 登录/登出统一从 libunftp 事件触发
+    let presence_sessions = SessionRegistry::with_existing_map(Arc::clone(&sessions_inner), logger.clone());
+    let presence = SimplePresenceListener { sessions: presence_sessions };
+
+    // DataListener —— 上传/下载/操作事件（level=4 走 SESSION:DATA 通道）
+    let data = SimpleDataListener { logger: logger.clone() };
+
+    // idle 清理也共享同一张表
+    let cleanup_sessions = SessionRegistry::with_existing_map(sessions_inner, logger.clone());
+
+    let mut builder = ServerBuilder::with_user_detail_provider(factory, Arc::new(provider))
         .authenticator(Arc::new(auth))
-        .greeting("FServer FTP ready")
-        .build()
-        .expect("server build failed");
+        .notify_presence(presence)
+        .notify_data(data);
+
+    // 横幅：空串/None 用 libunftp 默认；非空才覆盖
+    if !greeting.is_empty() {
+        // ServerBuilder::greeting 要求 &'static str —— 用 Box::leak 泄漏一下（长驻进程可接受）
+        let leaked: &'static str = Box::leak(greeting.into_boxed_str());
+        builder = builder.greeting(leaked);
+    }
+
+    // 被动端口范围：0,0 不调用（让 OS 分配）
+    if passive_port_range != (0, 0) {
+        builder = builder.passive_ports(passive_port_range.0..=passive_port_range.1);
+    }
+
+    let server = builder.build().expect("server build failed");
 
     let (stop_tx, stop_rx) = broadcast::channel::<()>(1);
-    let cleanup_fut = sessions.idle_cleanup(stop_rx);
+    let cleanup_fut = cleanup_sessions.idle_cleanup(stop_rx);
 
     running_clone.store(true, Ordering::Release);
     emit(cb_opt, ctx, 1, &format!("FTP 服务已启动，监听 {}，根目录 {:?}", bind_str, root_display));
@@ -784,7 +1008,7 @@ fn run_server(
                 emit(cb_opt, ctx, 1, "收到停止信号，正在关闭...");
                 let _ = stop_tx.send(());
             }
-            _ = cleanup_fut => { /* 不会单独退出，tick 永远跑 */ }
+            _ = cleanup_fut => { }
         }
     });
 
