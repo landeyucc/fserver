@@ -1,0 +1,58 @@
+<Application x:Class="FServer.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:FServer.App"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Themes/LightTheme.xaml"/>
+                <ResourceDictionary Source="Themes/DataGridStyles.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- ====== 停止按钮样式：BasedOn PrimaryButton 以保证尺寸完全一致，只覆盖颜色 ====== -->
+            <Style x:Key="StopButton" TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                <Setter Property="Background" Value="#EF4444"/>
+                <Setter Property="BorderBrush" Value="#EF4444"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="BtnBorder"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="4"
+                                    Padding="{TemplateBinding Padding}"
+                                    SnapsToDevicePixels="True">
+                                <ContentPresenter HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center"
+                                                  TextElement.Foreground="{TemplateBinding Foreground}"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="BtnBorder" Property="Background" Value="#DC2626"/>
+                                    <Setter TargetName="BtnBorder" Property="BorderBrush" Value="#DC2626"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter TargetName="BtnBorder" Property="Background" Value="#B91C1C"/>
+                                    <Setter TargetName="BtnBorder" Property="BorderBrush" Value="#B91C1C"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter TargetName="BtnBorder" Property="Background" Value="#FCA5A5"/>
+                                    <Setter TargetName="BtnBorder" Property="BorderBrush" Value="#FCA5A5"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <local:BoolToStatusBrushConverter x:Key="BoolToStatusBrush"/>
+            <local:BoolToRunTextConverter x:Key="BoolToRunText"/>
+            <local:ObjectToEnabledConverter x:Key="ObjectToEnabled"/>
+            <local:BoolToProtectedTipConverter x:Key="BoolToProtectedTip"/>
+            <local:BoolInvertConverter x:Key="BoolInvert"/>
+            <local:BoolToStyleConverter x:Key="BoolToToggleBtnStyle"/>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

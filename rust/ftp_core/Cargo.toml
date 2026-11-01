@@ -1,0 +1,29 @@
+[package]
+name = "ftp_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ftp_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+libunftp = "0.23"
+unftp-core = "0.1"
+unftp-sbe-fs = "0.4"
+unftp-sbe-rooter = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+parking_lot = "0.12"
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# 注意：我们在 FTP worker 线程开头装了 panic hook，任何 panic（无论 abort/unwind）
+# 都会先把完整 panic 消息 + location 推到 C# 日志。
+# 但为了让日志在进程消失前尽量完整，选 abort 最稳——
+# abort 前 hook 先跑完 stderr + C# 回调，然后 OS 结束进程。
+# 要彻底避免"用户一删就崩"，根因是写操作前做防御性检查。
+panic = "abort"
