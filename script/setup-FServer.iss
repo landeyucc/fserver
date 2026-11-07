@@ -90,9 +90,9 @@ DisableWelcomePage=no
 VersionInfoVersion=1.0
 VersionInfoTextVersion=1.0
 VersionInfoProductVersion=1.0
-AppPublisherURL=https://coldsea.vip
+AppPublisherURL=https://fserver.coldsea.vip
 AppSupportURL=https://coldsea.vip
-AppUpdatesURL=https://coldsea.vip
+AppUpdatesURL=https://fserver.coldsea.vip
 
 [Languages]
 #if VER >= EncodeVer(6,0,0)
